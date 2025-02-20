@@ -1,87 +1,102 @@
-import os
+from flask import Flask, request
 import json
-from flask import Flask, request, jsonify
-from binance.client import Client
-from dotenv import load_dotenv
+import pandas as pd
+import ccxt
 
-# .env dosyasından API bilgilerini yükle
-load_dotenv()
 
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-# Binance API Bağlantısı
-client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+longPozisyonda = False
+shortPozisyonda = False
+pozisyondami = False
+
+
 
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return "TradingView Webhook to Binance Futures is running."
 
-@app.route('/webhook', methods=['POST'])
+@app.route("/webhook", methods=['POST'])
 def webhook():
+
     try:
-        data = request.get_json()
-        print("Received data:", data)
+        data = json.loads(request.data)
+        ticker = data['ticker']
+        veri=ticker.split(".")
+        symbol=veri[0]
+        price = data['price']
+        islem = data['side']
+        quantity = data['quantity']
+        binanceapi=data['binanceApiKey']
+        binancesecret=data['binanceSecretKey']
 
-        symbol = data.get("symbol", "")
-        action = data.get("action", "").upper()  # BUY, SELL veya STOP
-        quantity = float(data.get("quantity", 0.01))
-        order_type = data.get("order_type", "MARKET").upper()  # MARKET veya LIMIT
-        price = float(data.get("price", 0)) if "price" in data else None
-        leverage = int(data.get("leverage", 20))  # Varsayılan kaldıraç: 20
+        exchange = ccxt.binance({
+        'apiKey': binanceapi,
+        'secret': binancesecret,
+        'options': {
+        'adjustForTimeDifference': True,
+        'defaultType': 'future'
+    
+        },
+        'enableRateLimit': True
+        })
 
-        # Binance Futures Kaldıraç Ayarı
-        try:
-            client.futures_change_leverage(symbol=symbol, leverage=leverage)
-        except Exception as e:
-            return jsonify({"error": f"Kaldıraç ayarlanırken hata oluştu: {str(e)}"}), 500
+        balance = exchange.fetch_balance()
+        positions = balance['info']['positions']
+        current_positions = [position for position in positions if float(position['positionAmt']) != 0 and position['symbol'] == symbol]
+        position_bilgi = pd.DataFrame(current_positions, columns=["symbol", "entryPrice", "unrealizedProfit", "isolatedWallet", "positionAmt", "positionSide"])
+        
+        
+        #Pozisyonda olup olmadığını kontrol etme
+        if not position_bilgi.empty and position_bilgi["positionAmt"][len(position_bilgi.index) - 1] != 0:
+            pozisyondami = True
+        else: 
+            pozisyondami = False
+            shortPozisyonda = False
+            longPozisyonda = False
+        
+        # Long pozisyonda mı?
+        if pozisyondami and float(position_bilgi["positionAmt"][len(position_bilgi.index) - 1]) > 0:
+            longPozisyonda = True
+            shortPozisyonda = False
+        # Short pozisyonda mı?
+        if pozisyondami and float(position_bilgi["positionAmt"][len(position_bilgi.index) - 1]) < 0:
+            shortPozisyonda = True
+            longPozisyonda = False
 
-        if action in ["BUY", "SELL"]:
-            # Yeni pozisyon açma
-            if order_type == "MARKET":
-                order = client.futures_create_order(
-                    symbol=symbol,
-                    side=action,
-                    type="MARKET",
-                    quantity=quantity
-                )
-            elif order_type == "LIMIT" and price:
-                order = client.futures_create_order(
-                    symbol=symbol,
-                    side=action,
-                    type="LIMIT",
-                    quantity=quantity,
-                    price=price,
-                    timeInForce="GTC"
-                )
-            else:
-                return jsonify({"error": "Invalid order type"}), 400
+        if islem=="BUY":
+            if longPozisyonda == False:
+                if shortPozisyonda:
+                    order = exchange.create_market_buy_order(symbol, (float(position_bilgi["positionAmt"][len(position_bilgi.index) - 1]) * -1), {"reduceOnly": True})
+                alinacak_miktar = float(quantity)/float(price)
+                order = exchange.create_market_buy_order(symbol, alinacak_miktar)
 
-            return jsonify({"status": "Order placed", "order": order}), 200
 
-        elif action == "STOP":
-            # Açık pozisyonları kapatma
-            positions = client.futures_position_information()
-            for pos in positions:
-                if pos["symbol"] == symbol and float(pos["positionAmt"]) != 0:
-                    side = "SELL" if float(pos["positionAmt"]) > 0 else "BUY"
-                    close_order = client.futures_create_order(
-                        symbol=symbol,
-                        side=side,
-                        type="MARKET",
-                        quantity=abs(float(pos["positionAmt"]))
-                    )
-                    return jsonify({"status": "Position closed", "order": close_order}), 200
-            
-            return jsonify({"status": "No open positions found"}), 200
+        if islem=="SELL":
+            if shortPozisyonda == False:
+                if longPozisyonda:
+                    order = exchange.create_market_sell_order(symbol, float(position_bilgi["positionAmt"][len(position_bilgi.index) - 1]), {"reduceOnly": True})
+                alinacak_miktar = float(quantity)/float(price)
+                order = exchange.create_market_sell_order(symbol, alinacak_miktar)
 
-        else:
-            return jsonify({"error": "Invalid action"}), 400
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        if islem=="STOP":
+            if longPozisyonda:
+                order = exchange.create_market_sell_order(symbol, float(position_bilgi["positionAmt"][len(position_bilgi.index) - 1]), {"reduceOnly": True})
 
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+            if shortPozisyonda:
+                order = exchange.create_market_buy_order(symbol, float(position_bilgi["positionAmt"][len(position_bilgi.index) - 1]), {"reduceOnly": True})
+
+        if islem=="KAR":
+            if longPozisyonda:
+                alinacak = (float(quantity)/float(price))/2
+                order = exchange.create_market_sell_order(symbol, alinacak)
+
+            if shortPozisyonda:
+                alinacak = (float(quantity)/float(price))/2
+                order = exchange.create_market_buy_order(symbol, alinacak)
+
+
+    except:
+        pass
+    return {
+        "code": "success",
+    }
