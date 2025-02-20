@@ -1,102 +1,93 @@
-from flask import Flask, request
+﻿from flask import Flask, request
 import json
 import pandas as pd
 import ccxt
-
-
 
 longPozisyonda = False
 shortPozisyonda = False
 pozisyondami = False
 
-
-
 app = Flask(__name__)
-
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
-
     try:
         data = json.loads(request.data)
-        ticker = data['ticker']
-        veri=ticker.split(".")
-        symbol=veri[0]
-        price = data['price']
-        islem = data['side']
-        quantity = data['quantity']
-        binanceapi=data['binanceApiKey']
-        binancesecret=data['binanceSecretKey']
+        print("Gelen Webhook Verisi:", data)  # Gelen veriyi kontrol et
+
+        ticker = data.get('ticker', '')
+        veri = ticker.split(".")
+        symbol = veri[0] if veri else ''
+        price = float(data.get('price', 0))
+        islem = data.get('side', '')
+        quantity = float(data.get('quantity', 0))
+        binanceapi = data.get('binanceApiKey', '')
+        binancesecret = data.get('binanceSecretKey', '')
 
         exchange = ccxt.binance({
-        'apiKey': binanceapi,
-        'secret': binancesecret,
-        'options': {
-        'adjustForTimeDifference': True,
-        'defaultType': 'future'
-    
-        },
-        'enableRateLimit': True
+            'apiKey': binanceapi,
+            'secret': binancesecret,
+            'options': {
+                'adjustForTimeDifference': True,
+                'defaultType': 'future'
+            },
+            'enableRateLimit': True
         })
 
         balance = exchange.fetch_balance()
-        positions = balance['info']['positions']
+        positions = balance['info'].get('positions', [])
         current_positions = [position for position in positions if float(position['positionAmt']) != 0 and position['symbol'] == symbol]
-        position_bilgi = pd.DataFrame(current_positions, columns=["symbol", "entryPrice", "unrealizedProfit", "isolatedWallet", "positionAmt", "positionSide"])
-        
-        
-        #Pozisyonda olup olmadığını kontrol etme
-        if not position_bilgi.empty and position_bilgi["positionAmt"][len(position_bilgi.index) - 1] != 0:
+        position_bilgi = pd.DataFrame(current_positions)
+
+        global pozisyondami, longPozisyonda, shortPozisyonda
+        if not position_bilgi.empty and float(position_bilgi.iloc[-1]['positionAmt']) != 0:
             pozisyondami = True
-        else: 
+        else:
             pozisyondami = False
             shortPozisyonda = False
             longPozisyonda = False
-        
-        # Long pozisyonda mı?
-        if pozisyondami and float(position_bilgi["positionAmt"][len(position_bilgi.index) - 1]) > 0:
+
+        if pozisyondami and float(position_bilgi.iloc[-1]['positionAmt']) > 0:
             longPozisyonda = True
             shortPozisyonda = False
-        # Short pozisyonda mı?
-        if pozisyondami and float(position_bilgi["positionAmt"][len(position_bilgi.index) - 1]) < 0:
+        if pozisyondami and float(position_bilgi.iloc[-1]['positionAmt']) < 0:
             shortPozisyonda = True
             longPozisyonda = False
 
-        if islem=="BUY":
-            if longPozisyonda == False:
+        print(f"İşlem: {islem}, Symbol: {symbol}, Fiyat: {price}, Miktar: {quantity}")
+
+        if islem == "BUY":
+            if not longPozisyonda:
                 if shortPozisyonda:
-                    order = exchange.create_market_buy_order(symbol, (float(position_bilgi["positionAmt"][len(position_bilgi.index) - 1]) * -1), {"reduceOnly": True})
-                alinacak_miktar = float(quantity)/float(price)
+                    order = exchange.create_market_buy_order(symbol, abs(float(position_bilgi.iloc[-1]['positionAmt'])), {"reduceOnly": True})
+                alinacak_miktar = quantity / price
                 order = exchange.create_market_buy_order(symbol, alinacak_miktar)
+                print("BUY Order Başarılı:", order)
 
-
-        if islem=="SELL":
-            if shortPozisyonda == False:
+        if islem == "SELL":
+            if not shortPozisyonda:
                 if longPozisyonda:
-                    order = exchange.create_market_sell_order(symbol, float(position_bilgi["positionAmt"][len(position_bilgi.index) - 1]), {"reduceOnly": True})
-                alinacak_miktar = float(quantity)/float(price)
+                    order = exchange.create_market_sell_order(symbol, float(position_bilgi.iloc[-1]['positionAmt']), {"reduceOnly": True})
+                alinacak_miktar = quantity / price
                 order = exchange.create_market_sell_order(symbol, alinacak_miktar)
+                print("SELL Order Başarılı:", order)
 
-
-        if islem=="STOP":
+        if islem == "STOP":
             if longPozisyonda:
-                order = exchange.create_market_sell_order(symbol, float(position_bilgi["positionAmt"][len(position_bilgi.index) - 1]), {"reduceOnly": True})
-
+                order = exchange.create_market_sell_order(symbol, float(position_bilgi.iloc[-1]['positionAmt']), {"reduceOnly": True})
             if shortPozisyonda:
-                order = exchange.create_market_buy_order(symbol, float(position_bilgi["positionAmt"][len(position_bilgi.index) - 1]), {"reduceOnly": True})
+                order = exchange.create_market_buy_order(symbol, float(position_bilgi.iloc[-1]['positionAmt']), {"reduceOnly": True})
+            print("STOP Order Başarılı:", order)
 
-        if islem=="KAR":
+        if islem == "KAR":
+            alinacak = (quantity / price) / 2
             if longPozisyonda:
-                alinacak = (float(quantity)/float(price))/2
                 order = exchange.create_market_sell_order(symbol, alinacak)
-
             if shortPozisyonda:
-                alinacak = (float(quantity)/float(price))/2
                 order = exchange.create_market_buy_order(symbol, alinacak)
+            print("KAR Order Başarılı:", order)
 
-
-    except:
-        pass
-    return {
-        "code": "success",
-    }
+    except Exception as e:
+        print("Hata:", str(e))
+    
+    return {"code": "success"}
