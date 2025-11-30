@@ -80,7 +80,7 @@ def webhook():
             print("STOP Order Başarılı:", order)
 
         if islem == "KAR":
-            alinacak = (quantity / price) / 2
+            alinacak = (quantity / price) * 0.80
             if longPozisyonda:
                 order = exchange.create_market_sell_order(symbol, alinacak)
             if shortPozisyonda:
