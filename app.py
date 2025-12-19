@@ -1,88 +1,140 @@
 from flask import Flask, request
 import json
+import pandas as pd
 import ccxt
+
+longPozisyonda = False
+shortPozisyonda = False
+pozisyondami = False
 
 app = Flask(__name__)
 
-@app.route("/webhook", methods=["POST"])
+@app.route("/webhook", methods=['POST'])
 def webhook():
-
     try:
-        data = request.json
+        data = json.loads(request.data)
+        print("Gelen Webhook Verisi:", data)
 
-        ticker = data["ticker"]
-        symbol = ticker.split(".")[0]
-        price = float(data["price"])
-        side = data["side"]
-        quantity = float(data["quantity"])
-        api_key = data["binanceApiKey"]
-        api_secret = data["binanceSecretKey"]
+        ticker = data.get('ticker', '')
+        veri = ticker.split(".")
+        symbol = veri[0] if veri else ''
 
-        # Binance Future bağlan
+        price = float(data.get('price', 0))
+        islem = data.get('side', '')
+        quantity = float(data.get('quantity', 0))
+
+        binanceapi = data.get('binanceApiKey', '')
+        binancesecret = data.get('binanceSecretKey', '')
+
         exchange = ccxt.binance({
-            "apiKey": api_key,
-            "secret": api_secret,
-            "options": {
-                "defaultType": "future"
+            'apiKey': binanceapi,
+            'secret': binancesecret,
+            'options': {
+                'adjustForTimeDifference': True,
+                'defaultType': 'future'
             },
-            "enableRateLimit": True
+            'enableRateLimit': True
         })
 
-        # ---- 1) Pozisyon kontrolü (FAST + AZ WEIGHT) ----
-        positions = exchange.fetch_positions([symbol])
+        balance = exchange.fetch_balance()
+        positions = balance['info'].get('positions', [])
+        current_positions = [
+            p for p in positions
+            if float(p['positionAmt']) != 0 and p['symbol'] == symbol
+        ]
 
-        longPos = 0
-        shortPos = 0
+        position_bilgi = pd.DataFrame(current_positions)
 
-        for pos in positions:
-            amt = float(pos["contracts"])
-            if amt > 0:
-                longPos = amt
-            elif amt < 0:
-                shortPos = abs(amt)
+        global pozisyondami, longPozisyonda, shortPozisyonda
 
-        # ---- 2) İşlemleri yönet ----
+        if not position_bilgi.empty:
+            pozisyondami = True
+            pos_amt = float(position_bilgi.iloc[-1]['positionAmt'])
+            longPozisyonda = pos_amt > 0
+            shortPozisyonda = pos_amt < 0
+        else:
+            pozisyondami = False
+            longPozisyonda = False
+            shortPozisyonda = False
 
-        # LONG AÇ
-        if side == "BUY":
-            # varsa SHORT kapat
-            if shortPos > 0:
-                exchange.create_order(symbol, "market", "buy", shortPos, params={"reduceOnly": True})
+        print(f"İşlem: {islem}, Symbol: {symbol}, Fiyat: {price}, Miktar: {quantity}")
 
-            # yeni long aç
-            amount = quantity / price
-            exchange.create_order(symbol, "market", "buy", amount)
+        # ================= BUY =================
+        if islem == "BUY":
+            if not longPozisyonda:
+                if shortPozisyonda:
+                    exchange.create_market_buy_order(
+                        symbol,
+                        abs(float(position_bilgi.iloc[-1]['positionAmt'])),
+                        {"reduceOnly": True}
+                    )
 
-        # SHORT AÇ
-        elif side == "SELL":
-            # varsa LONG kapat
-            if longPos > 0:
-                exchange.create_order(symbol, "market", "sell", longPos, params={"reduceOnly": True})
+                alinacak_miktar = quantity / price
+                order = exchange.create_market_buy_order(symbol, alinacak_miktar)
+                print("BUY Order Başarılı:", order)
 
-            # yeni short aç
-            amount = quantity / price
-            exchange.create_order(symbol, "market", "sell", amount)
+        # ================= SELL (kullanılmıyor ama dursun) =================
+        if islem == "SELL":
+            if not shortPozisyonda:
+                if longPozisyonda:
+                    exchange.create_market_sell_order(
+                        symbol,
+                        float(position_bilgi.iloc[-1]['positionAmt']),
+                        {"reduceOnly": True}
+                    )
 
-        # STOP → Pozisyon kapatma
-        elif side == "STOP":
-            if longPos > 0:
-                exchange.create_order(symbol, "market", "sell", longPos, params={"reduceOnly": True})
-            if shortPos > 0:
-                exchange.create_order(symbol, "market", "buy", shortPos, params={"reduceOnly": True})
+                alinacak_miktar = quantity / price
+                order = exchange.create_market_sell_order(symbol, alinacak_miktar)
+                print("SELL Order Başarılı:", order)
 
-        # KAR → Yarım kapatma
-        elif side == "KAR":
-            half_amount = (quantity / price) / 2
+        # ================= TP1 → %50 KAR =================
+        if islem == "TP1" and pozisyondami:
+            pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
+            alinacak = pozisyon_miktari * 0.50
 
-            if longPos > 0:
-                exchange.create_order(symbol, "market", "sell", half_amount)
-                
-            if shortPos > 0:
-                exchange.create_order(symbol, "market", "buy", half_amount)
+            if longPozisyonda:
+                order = exchange.create_market_sell_order(
+                    symbol, alinacak, {"reduceOnly": True}
+                )
+            if shortPozisyonda:
+                order = exchange.create_market_buy_order(
+                    symbol, alinacak, {"reduceOnly": True}
+                )
 
-        return {"status": "OK"}
+            print("TP1 (%50) KAR Order Başarılı:", order)
+
+        # ================= TP2 → %30 KAR =================
+        if islem == "TP2" and pozisyondami:
+            pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
+            alinacak = pozisyon_miktari * 0.30
+
+            if longPozisyonda:
+                order = exchange.create_market_sell_order(
+                    symbol, alinacak, {"reduceOnly": True}
+                )
+            if shortPozisyonda:
+                order = exchange.create_market_buy_order(
+                    symbol, alinacak, {"reduceOnly": True}
+                )
+
+            print("TP2 (%30) KAR Order Başarılı:", order)
+
+        # ================= STOP → KALAN %20 =================
+        if islem == "STOP" and pozisyondami:
+            pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
+
+            if longPozisyonda:
+                order = exchange.create_market_sell_order(
+                    symbol, pozisyon_miktari, {"reduceOnly": True}
+                )
+            if shortPozisyonda:
+                order = exchange.create_market_buy_order(
+                    symbol, pozisyon_miktari, {"reduceOnly": True}
+                )
+
+            print("STOP Order Başarılı:", order)
 
     except Exception as e:
-        print("HATA:", e)
-        return {"status": "ERROR", "message": str(e)}
+        print("Hata:", str(e))
 
+    return {"code": "success"}
