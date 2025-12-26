@@ -106,7 +106,7 @@ def webhook():
         # ================= TP2 → %30 KAR =================
         if islem == "TP2" and pozisyondami:
             pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
-            alinacak = pozisyon_miktari * 0.30
+            alinacak = pozisyon_miktari * 0.50
 
             if longPozisyonda:
                 order = exchange.create_market_sell_order(
