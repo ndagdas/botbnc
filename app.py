@@ -36,6 +36,9 @@ def webhook():
             'enableRateLimit': True
         })
 
+        # 🔴 BINANCE FUTURES TESTNET
+        exchange.set_sandbox_mode(True)
+
         balance = exchange.fetch_balance()
         positions = balance['info'].get('positions', [])
         current_positions = [
@@ -73,7 +76,7 @@ def webhook():
                 order = exchange.create_market_buy_order(symbol, alinacak_miktar)
                 print("BUY Order Başarılı:", order)
 
-        # ================= SELL (kullanılmıyor ama dursun) =================
+        # ================= SELL =================
         if islem == "SELL":
             if not shortPozisyonda:
                 if longPozisyonda:
@@ -87,7 +90,7 @@ def webhook():
                 order = exchange.create_market_sell_order(symbol, alinacak_miktar)
                 print("SELL Order Başarılı:", order)
 
-        # ================= TP1 → %50 KAR =================
+        # ================= TP1 → %50 =================
         if islem == "TP1" and pozisyondami:
             pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
             alinacak = pozisyon_miktari * 0.50
@@ -101,9 +104,9 @@ def webhook():
                     symbol, alinacak, {"reduceOnly": True}
                 )
 
-            print("TP1 (%50) KAR Order Başarılı:", order)
+            print("TP1 (%50) Order Başarılı:", order)
 
-        # ================= TP2 → %30 KAR =================
+        # ================= TP2 → %30 =================
         if islem == "TP2" and pozisyondami:
             pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
             alinacak = pozisyon_miktari * 0.50
@@ -117,9 +120,9 @@ def webhook():
                     symbol, alinacak, {"reduceOnly": True}
                 )
 
-            print("TP2 (%30) KAR Order Başarılı:", order)
+            print("TP2 (%30) Order Başarılı:", order)
 
-        # ================= STOP → KALAN %20 =================
+        # ================= STOP → %100 KALAN =================
         if islem == "STOP" and pozisyondami:
             pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
 
