@@ -30,8 +30,8 @@ def webhook():
             'apiKey': binanceapi,
             'secret': binancesecret,
             'options': {
-                'adjustForTimeDifference': True,
-                'defaultType': 'future'
+                'defaultType': 'future',
+                'test': True   # 🔴 DEMO MODE
             },
             'enableRateLimit': True
         })
