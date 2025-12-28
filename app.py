@@ -36,9 +36,6 @@ def webhook():
             'enableRateLimit': True
         })
 
-        # 🔴 LEVERAGE (OLMAZSA OLMAZ)
-        exchange.set_leverage(40, symbol)
-
         balance = exchange.fetch_balance()
         positions = balance['info'].get('positions', [])
         current_positions = [
@@ -72,11 +69,11 @@ def webhook():
                         {"reduceOnly": True}
                     )
 
-                alinacak_miktar = round(quantity / price, 3)
+                alinacak_miktar = quantity / price
                 order = exchange.create_market_buy_order(symbol, alinacak_miktar)
                 print("BUY Order Başarılı:", order)
 
-        # ================= SELL =================
+        # ================= SELL (kullanılmıyor ama dursun) =================
         if islem == "SELL":
             if not shortPozisyonda:
                 if longPozisyonda:
@@ -86,14 +83,14 @@ def webhook():
                         {"reduceOnly": True}
                     )
 
-                alinacak_miktar = round(quantity / price, 3)
+                alinacak_miktar = quantity / price
                 order = exchange.create_market_sell_order(symbol, alinacak_miktar)
                 print("SELL Order Başarılı:", order)
 
-        # ================= TP1 → %50 =================
+        # ================= TP1 → %50 KAR =================
         if islem == "TP1" and pozisyondami:
             pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
-            alinacak = round(pozisyon_miktari * 0.50, 3)
+            alinacak = pozisyon_miktari * 0.50
 
             if longPozisyonda:
                 order = exchange.create_market_sell_order(
@@ -104,12 +101,12 @@ def webhook():
                     symbol, alinacak, {"reduceOnly": True}
                 )
 
-            print("TP1 (%50) Order Başarılı:", order)
+            print("TP1 (%50) KAR Order Başarılı:", order)
 
-        # ================= TP2 → %30 =================
+        # ================= TP2 → %30 KAR =================
         if islem == "TP2" and pozisyondami:
             pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
-            alinacak = round(pozisyon_miktari * 0.50, 3)
+            alinacak = pozisyon_miktari * 0.30
 
             if longPozisyonda:
                 order = exchange.create_market_sell_order(
@@ -120,11 +117,11 @@ def webhook():
                     symbol, alinacak, {"reduceOnly": True}
                 )
 
-            print("TP2 (%30) Order Başarılı:", order)
+            print("TP2 (%30) KAR Order Başarılı:", order)
 
-        # ================= STOP → KALAN =================
+        # ================= STOP → KALAN %20 =================
         if islem == "STOP" and pozisyondami:
-            pozisyon_miktari = round(abs(float(position_bilgi.iloc[-1]['positionAmt'])), 3)
+            pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
 
             if longPozisyonda:
                 order = exchange.create_market_sell_order(
@@ -141,3 +138,5 @@ def webhook():
         print("Hata:", str(e))
 
     return {"code": "success"}
+
+
