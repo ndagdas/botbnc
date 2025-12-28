@@ -31,7 +31,7 @@ def webhook():
             'secret': binancesecret,
             'options': {
                 'defaultType': 'future',
-                'test': True   # 🔴 DEMO MODE
+                'test': True   # ✅ DEMO TRADING
             },
             'enableRateLimit': True
         })
