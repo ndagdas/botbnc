@@ -140,4 +140,3 @@ def webhook():
     return {"code": "success"}
 
 
-kod yapısını bozmadan düzeltmeyi yaparmısın
