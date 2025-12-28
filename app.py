@@ -2,6 +2,8 @@ from flask import Flask, request
 import json
 import pandas as pd
 import ccxt
+import hmac
+import hashlib
 
 longPozisyonda = False
 shortPozisyonda = False
@@ -19,7 +21,7 @@ class MockBinanceExchange:
         }
         print("⚠️  TEST MODU AKTİF: Mock Binance Exchange kullanılıyor")
     
-    def fetch_balance(self):
+    def fetch_balance(self, params=None):
         """Mock balance döndür"""
         return {
             'USDT': self.balance['USDT'],
@@ -40,7 +42,6 @@ class MockBinanceExchange:
             'price': 0,
             'cost': 0,
             'status': 'closed',
-            'timestamp': pd.Timestamp.now(),
             'params': params,
             'reduceOnly': params.get('reduceOnly', False) if params else False
         }
@@ -64,7 +65,6 @@ class MockBinanceExchange:
             'price': 0,
             'cost': 0,
             'status': 'closed',
-            'timestamp': pd.Timestamp.now(),
             'params': params,
             'reduceOnly': params.get('reduceOnly', False) if params else False
         }
@@ -148,12 +148,14 @@ class MockBinanceExchange:
 
 def get_exchange(data):
     """Exchange objesini döndürür - test modu data içindeki flag'e göre"""
-    test_mode = data.get('testMode', False)
+    test_mode = data.get('testMode', True)  # Varsayılan olarak True
+    
+    print(f"🔧 Test modu: {test_mode}")
     
     if test_mode:
         return MockBinanceExchange()
     
-    # Gerçek mod
+    # GERÇEK MOD - Binance Futures API için doğru konfigürasyon
     binanceapi = data.get('binanceApiKey', '')
     binancesecret = data.get('binanceSecretKey', '')
     
@@ -161,15 +163,39 @@ def get_exchange(data):
         print("⚠️  API key bulunamadı! Test moduna geçiliyor...")
         return MockBinanceExchange()
     
-    return ccxt.binance({
-        'apiKey': binanceapi,
-        'secret': binancesecret,
-        'options': {
-            'adjustForTimeDifference': True,
-            'defaultType': 'future'
-        },
-        'enableRateLimit': True
-    })
+    try:
+        # Binance Futures için doğru konfigürasyon
+        exchange = ccxt.binance({
+            'apiKey': binanceapi.strip(),
+            'secret': binancesecret.strip(),
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'future',  # FUTURES trading
+                'adjustForTimeDifference': True,
+            },
+            'urls': {
+                'api': {
+                    'public': 'https://fapi.binance.com',
+                    'private': 'https://fapi.binance.com',
+                }
+            }
+        })
+        
+        # API key kontrolü
+        print("🔑 API Key doğrulanıyor...")
+        exchange.check_required_credentials()
+        
+        # Basit bir test yapalım
+        print("🔍 Bağlantı testi yapılıyor...")
+        exchange.fetch_time()
+        print("✅ Binance API bağlantısı başarılı!")
+        
+        return exchange
+        
+    except Exception as e:
+        print(f"❌ Binance API bağlantı hatası: {str(e)}")
+        print("⚠️  Test moduna geçiliyor...")
+        return MockBinanceExchange()
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
@@ -181,22 +207,31 @@ def webhook():
         print("📨 WEBHOOK ALINDI")
         print("="*60)
         
-        # Test modunu kontrol et
-        test_mode = data.get('testMode', False)
+        # Test modunu kontrol et (varsayılan: test modu)
+        test_mode = data.get('testMode', True)
         mode_text = "TEST" if test_mode else "GERÇEK"
         print(f"🔧 MOD: {mode_text}")
+        
+        # Güvenlik kontrolü - test modunda bile API key gönderilmişse uyar
+        if test_mode and ('binanceApiKey' in data or 'binanceSecretKey' in data):
+            print("⚠️  DİKKAT: Test modunda ama API key gönderildi!")
+            print("⚠️  API key'ler göz ardı edilecek...")
         
         # Verileri al
         ticker = data.get('ticker', 'BTCUSDT.P')
         veri = ticker.split(".")
         symbol = veri[0] if veri else ''
         
+        # Binance Futures sembol formatına çevir (BTCUSDT.P → BTCUSDT)
+        if symbol.endswith('.P'):
+            symbol = symbol.replace('.P', '')
+        
         price = float(data.get('price', 0))
         islem = data.get('side', '')
         quantity = float(data.get('quantity', 0))
         
-        if not price or not islem or not quantity:
-            print("❌ Eksik veri! price, side veya quantity bulunamadı.")
+        if not price or not islem:
+            print("❌ Eksik veri! price veya side bulunamadı.")
             return {"code": "error", "message": "Eksik veri"}
         
         print(f"📊 Sembol: {symbol}")
@@ -208,32 +243,40 @@ def webhook():
         exchange = get_exchange(data)
         
         # Pozisyon bilgilerini al
-        balance = exchange.fetch_balance()
-        positions = balance['info'].get('positions', [])
-        
-        current_positions = [
-            p for p in positions
-            if float(p.get('positionAmt', 0)) != 0 and p.get('symbol') == symbol
-        ]
-        
-        position_bilgi = pd.DataFrame(current_positions)
-        
-        # Pozisyon durumunu güncelle
-        if not position_bilgi.empty and not position_bilgi.iloc[-1].empty:
-            pozisyondami = True
-            pos_amt = float(position_bilgi.iloc[-1].get('positionAmt', 0))
-            longPozisyonda = pos_amt > 0
-            shortPozisyonda = pos_amt < 0
+        try:
+            balance = exchange.fetch_balance()
+            positions = balance['info'].get('positions', [])
             
-            print(f"📈 POZİSYON DURUMU:")
-            print(f"   Aktif: {'EVET' if pozisyondami else 'HAYIR'}")
-            print(f"   Tip: {'LONG' if longPozisyonda else 'SHORT' if shortPozisyonda else 'YOK'}")
-            print(f"   Miktar: {abs(pos_amt):.6f}")
-        else:
+            current_positions = [
+                p for p in positions
+                if float(p.get('positionAmt', 0)) != 0 and p.get('symbol') == symbol
+            ]
+            
+            position_bilgi = pd.DataFrame(current_positions)
+            
+            # Pozisyon durumunu güncelle
+            if not position_bilgi.empty and not position_bilgi.iloc[-1].empty:
+                pozisyondami = True
+                pos_amt = float(position_bilgi.iloc[-1].get('positionAmt', 0))
+                longPozisyonda = pos_amt > 0
+                shortPozisyonda = pos_amt < 0
+                
+                print(f"📈 POZİSYON DURUMU:")
+                print(f"   Aktif: {'EVET' if pozisyondami else 'HAYIR'}")
+                print(f"   Tip: {'LONG' if longPozisyonda else 'SHORT' if shortPozisyonda else 'YOK'}")
+                print(f"   Miktar: {abs(pos_amt):.6f}")
+            else:
+                pozisyondami = False
+                longPozisyonda = False
+                shortPozisyonda = False
+                print(f"📭 AKTİF POZİSYON YOK")
+                
+        except Exception as e:
+            print(f"⚠️  Pozisyon bilgisi alınamadı: {str(e)}")
             pozisyondami = False
             longPozisyonda = False
             shortPozisyonda = False
-            print(f"📭 AKTİF POZİSYON YOK")
+            position_bilgi = pd.DataFrame()
         
         # İşlemleri yap
         print("\n⚡ İŞLEM YÜRÜTÜLÜYOR...")
@@ -241,41 +284,47 @@ def webhook():
         # ================= BUY =================
         if islem == "BUY":
             if not longPozisyonda:
-                if shortPozisyonda:
+                if shortPozisyonda and not position_bilgi.empty:
                     print("🔄 Short pozisyon kapatılıyor...")
                     exchange.create_market_buy_order(
                         symbol,
-                        abs(float(position_bilgi.iloc[-1].get('positionAmt', 0))) if not position_bilgi.empty else 0,
+                        abs(float(position_bilgi.iloc[-1].get('positionAmt', 0))),
                         {"reduceOnly": True}
                     )
                 
-                alinacak_miktar = quantity / price
-                print(f"🟢 Long pozisyon açılıyor: {alinacak_miktar:.6f} adet")
-                order = exchange.create_market_buy_order(symbol, alinacak_miktar)
-                print(f"✅ BUY Order Tamamlandı")
+                if quantity > 0:
+                    alinacak_miktar = quantity / price
+                    print(f"🟢 Long pozisyon açılıyor: {alinacak_miktar:.6f} adet")
+                    order = exchange.create_market_buy_order(symbol, alinacak_miktar)
+                    print(f"✅ BUY Order Tamamlandı")
+                else:
+                    print("⚠️  Quantity 0, işlem yapılmadı")
             else:
                 print("ℹ️  Zaten LONG pozisyonda, işlem yapılmadı")
         
         # ================= SELL =================
         elif islem == "SELL":
             if not shortPozisyonda:
-                if longPozisyonda:
+                if longPozisyonda and not position_bilgi.empty:
                     print("🔄 Long pozisyon kapatılıyor...")
                     exchange.create_market_sell_order(
                         symbol,
-                        float(position_bilgi.iloc[-1].get('positionAmt', 0)) if not position_bilgi.empty else 0,
+                        float(position_bilgi.iloc[-1].get('positionAmt', 0)),
                         {"reduceOnly": True}
                     )
                 
-                alinacak_miktar = quantity / price
-                print(f"🔴 Short pozisyon açılıyor: {alinacak_miktar:.6f} adet")
-                order = exchange.create_market_sell_order(symbol, alinacak_miktar)
-                print(f"✅ SELL Order Tamamlandı")
+                if quantity > 0:
+                    alinacak_miktar = quantity / price
+                    print(f"🔴 Short pozisyon açılıyor: {alinacak_miktar:.6f} adet")
+                    order = exchange.create_market_sell_order(symbol, alinacak_miktar)
+                    print(f"✅ SELL Order Tamamlandı")
+                else:
+                    print("⚠️  Quantity 0, işlem yapılmadı")
             else:
                 print("ℹ️  Zaten SHORT pozisyonda, işlem yapılmadı")
         
         # ================= TP1 → %50 KAR =================
-        elif islem == "TP1" and pozisyondami:
+        elif islem == "TP1" and pozisyondami and not position_bilgi.empty:
             pozisyon_miktari = abs(float(position_bilgi.iloc[-1].get('positionAmt', 0)))
             alinacak = pozisyon_miktari * 0.50
             
@@ -293,7 +342,7 @@ def webhook():
             print(f"✅ TP1 Order Tamamlandı")
         
         # ================= TP2 → %30 KAR =================
-        elif islem == "TP2" and pozisyondami:
+        elif islem == "TP2" and pozisyondami and not position_bilgi.empty:
             pozisyon_miktari = abs(float(position_bilgi.iloc[-1].get('positionAmt', 0)))
             alinacak = pozisyon_miktari * 0.30
             
@@ -310,8 +359,8 @@ def webhook():
             
             print(f"✅ TP2 Order Tamamlandı")
         
-        # ================= STOP → KALAN %20 =================
-        elif islem == "STOP" and pozisyondami:
+        # ================= STOP → KALAN TÜM POZİSYON =================
+        elif islem == "STOP" and pozisyondami and not position_bilgi.empty:
             pozisyon_miktari = abs(float(position_bilgi.iloc[-1].get('positionAmt', 0)))
             
             print(f"🛑 STOP ile pozisyon kapatılıyor: {pozisyon_miktari:.6f} adet")
@@ -353,21 +402,38 @@ def test_webhook():
             "test": "GET /test"
         },
         "usage": {
-            "test_mode": "Add 'testMode': true to your webhook payload",
-            "example": {
+            "test_mode": "Varsayılan olarak test modu aktif",
+            "gercek_mod": "Gerçek mod için 'testMode': false ve API key'ler gerekli",
+            "example_test": {
                 "ticker": "BTCUSDT.P",
                 "price": 50000,
                 "side": "BUY",
                 "quantity": 100,
                 "testMode": true
+            },
+            "example_real": {
+                "ticker": "BTCUSDT.P",
+                "price": 50000,
+                "side": "BUY",
+                "quantity": 100,
+                "testMode": false,
+                "binanceApiKey": "API_KEY_HERE",
+                "binanceSecretKey": "SECRET_KEY_HERE"
             }
         }
     }
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "service": "tradingview-webhook-bot"}
+
 if __name__ == "__main__":
     print("🚀 TradingView Webhook Bot Başlatılıyor...")
-    print("ℹ️  Test modu için webhook mesajına 'testMode': true ekleyin")
+    print("⚠️  UYARI: Varsayılan olarak TEST MODU aktif!")
+    print("ℹ️  Gerçek işlem yapmak için 'testMode': false gönderin ve API key'lerinizi ekleyin")
     print("🌐 Sunucu: http://localhost:5000")
     print("📌 Test endpoint: http://localhost:5000/test")
+    print("❤️  Health check: http://localhost:5000/health")
     print("\n" + "="*60)
     app.run(host="0.0.0.0", port=5000, debug=True)
