@@ -26,7 +26,7 @@ def webhook():
         binanceapi = data.get('binanceApiKey', '')
         binancesecret = data.get('binanceSecretKey', '')
 
-
+        # ================= TESTNET EXCHANGE =================
         exchange = ccxt.binance({
             'apiKey': binanceapi,
             'secret': binancesecret,
@@ -42,8 +42,7 @@ def webhook():
                 }
             }
         })
-
-        
+        # ====================================================
 
         balance = exchange.fetch_balance()
         positions = balance['info'].get('positions', [])
@@ -82,6 +81,20 @@ def webhook():
                 order = exchange.create_market_buy_order(symbol, alinacak_miktar)
                 print("BUY Order Başarılı:", order)
 
+        # ================= SELL (opsiyonel) =================
+        if islem == "SELL":
+            if not shortPozisyonda:
+                if longPozisyonda:
+                    exchange.create_market_sell_order(
+                        symbol,
+                        float(position_bilgi.iloc[-1]['positionAmt']),
+                        {"reduceOnly": True}
+                    )
+
+                alinacak_miktar = quantity / price
+                order = exchange.create_market_sell_order(symbol, alinacak_miktar)
+                print("SELL Order Başarılı:", order)
+
         # ================= TP1 → %50 =================
         if islem == "TP1" and pozisyondami:
             pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
@@ -91,8 +104,12 @@ def webhook():
                 order = exchange.create_market_sell_order(
                     symbol, alinacak, {"reduceOnly": True}
                 )
+            if shortPozisyonda:
+                order = exchange.create_market_buy_order(
+                    symbol, alinacak, {"reduceOnly": True}
+                )
 
-            print("TP1 (%50) KAR:", order)
+            print("TP1 (%50) KAR Order Başarılı:", order)
 
         # ================= TP2 → %30 =================
         if islem == "TP2" and pozisyondami:
@@ -103,8 +120,12 @@ def webhook():
                 order = exchange.create_market_sell_order(
                     symbol, alinacak, {"reduceOnly": True}
                 )
+            if shortPozisyonda:
+                order = exchange.create_market_buy_order(
+                    symbol, alinacak, {"reduceOnly": True}
+                )
 
-            print("TP2 (%30) KAR:", order)
+            print("TP2 (%30) KAR Order Başarılı:", order)
 
         # ================= STOP → %100 =================
         if islem == "STOP" and pozisyondami:
@@ -114,13 +135,18 @@ def webhook():
                 order = exchange.create_market_sell_order(
                     symbol, pozisyon_miktari, {"reduceOnly": True}
                 )
+            if shortPozisyonda:
+                order = exchange.create_market_buy_order(
+                    symbol, pozisyon_miktari, {"reduceOnly": True}
+                )
 
-            print("STOP Order:", order)
+            print("STOP Order Başarılı:", order)
 
     except Exception as e:
         print("Hata:", str(e))
 
     return {"code": "success"}
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
