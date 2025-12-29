@@ -18,6 +18,7 @@ def webhook():
         ticker = data.get('ticker', '')
         veri = ticker.split(".")
         symbol = veri[0] if veri else ''
+        symbol = symbol.replace(".P", "")
 
         price = float(data.get('price', 0))
         islem = data.get('side', '')
