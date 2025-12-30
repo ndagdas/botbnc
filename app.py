@@ -1,80 +1,109 @@
-from flask import Flask, request, jsonify
-from binance.client import Client
-from binance.enums import *
-import math
+from flask import Flask, request
+import json
+import pandas as pd
+import ccxt
 
 app = Flask(__name__)
 
-def get_client(api_key, api_secret):
-    client = Client(api_key, api_secret)
-    client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
-    return client
-
-def round_qty(qty, step):
-    return math.floor(qty / step) * step
+longPozisyonda = False
+pozisyondami = False
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    global longPozisyonda, pozisyondami
 
-    symbol = data["symbol"]
-    quantity = float(data["quantity"])
-    tp1 = float(data["tp1"])
-    tp2 = float(data["tp2"])
-    stop = float(data["stop"])
-    api_key = data["api_key"]
-    api_secret = data["api_secret"]
+    try:
+        data = json.loads(request.data)
+        print("Gelen Webhook:", data)
 
-    client = get_client(api_key, api_secret)
+        # ===== JSON'DAN GELENLER =====
+        ticker = data.get("ticker", "")
+        side = data.get("side", "")
+        price = float(data.get("price", 0))
+        quantity_usdt = float(data.get("quantity", 0))
 
-    # LOT SIZE bilgisi
-    exchange_info = client.futures_exchange_info()
-    for s in exchange_info["symbols"]:
-        if s["symbol"] == symbol:
-            step_size = float(s["filters"][1]["stepSize"])
+        api_key = data.get("binanceApiKey", "")
+        api_secret = data.get("binanceSecretKey", "")
 
-    quantity = round_qty(quantity, step_size)
+        # BTCUSDT.P -> BTCUSDT
+        symbol = ticker.split(".")[0]
 
-    # === MARKET BUY (LONG) ===
-    client.futures_create_order(
-        symbol=symbol,
-        side=SIDE_BUY,
-        type=ORDER_TYPE_MARKET,
-        quantity=quantity
-    )
+        # ===== CCXT BINANCE FUTURES TESTNET =====
+        exchange = ccxt.binance({
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+            "options": {
+                "defaultType": "future",
+                "adjustForTimeDifference": True
+            }
+        })
 
-    # === TP1 %50 ===
-    client.futures_create_order(
-        symbol=symbol,
-        side=SIDE_SELL,
-        type=ORDER_TYPE_LIMIT,
-        price=tp1,
-        quantity=round_qty(quantity * 0.5, step_size),
-        timeInForce=TIME_IN_FORCE_GTC,
-        reduceOnly=True
-    )
+        # 🔴 TESTNET AKTİF
+        exchange.set_sandbox_mode(True)
 
-    # === TP2 %30 ===
-    client.futures_create_order(
-        symbol=symbol,
-        side=SIDE_SELL,
-        type=ORDER_TYPE_LIMIT,
-        price=tp2,
-        quantity=round_qty(quantity * 0.3, step_size),
-        timeInForce=TIME_IN_FORCE_GTC,
-        reduceOnly=True
-    )
+        # ===== POZİSYON KONTROL =====
+        balance = exchange.fetch_balance()
+        positions = balance["info"]["positions"]
 
-    # === STOP %100 ===
-    client.futures_create_order(
-        symbol=symbol,
-        side=SIDE_SELL,
-        type=FUTURE_ORDER_TYPE_STOP_MARKET,
-        stopPrice=stop,
-        closePosition=True
-    )
+        current_pos = [
+            p for p in positions
+            if p["symbol"] == symbol and float(p["positionAmt"]) != 0
+        ]
 
-    return jsonify({"status": "OK"}), 200
+        if current_pos:
+            pozisyondami = True
+            pos_amt = float(current_pos[0]["positionAmt"])
+            longPozisyonda = pos_amt > 0
+        else:
+            pozisyondami = False
+            longPozisyonda = False
 
-if __name__ == "__main__":
-    app.run()
+        print(f"Side: {side}, Symbol: {symbol}, Pozisyon: {pozisyondami}")
+
+        # ================= BUY =================
+        if side == "BUY" and not pozisyondami:
+            qty = quantity_usdt / price
+            order = exchange.create_market_buy_order(symbol, qty)
+            print("BUY OK:", order)
+
+        # ================= TP1 %50 =================
+        if side == "TP1" and pozisyondami and longPozisyonda:
+            pos_qty = abs(float(current_pos[0]["positionAmt"]))
+            sell_qty = pos_qty * 0.50
+
+            order = exchange.create_market_sell_order(
+                symbol,
+                sell_qty,
+                {"reduceOnly": True}
+            )
+            print("TP1 OK:", order)
+
+        # ================= TP2 %30 =================
+        if side == "TP2" and pozisyondami and longPozisyonda:
+            pos_qty = abs(float(current_pos[0]["positionAmt"]))
+            sell_qty = pos_qty * 0.30
+
+            order = exchange.create_market_sell_order(
+                symbol,
+                sell_qty,
+                {"reduceOnly": True}
+            )
+            print("TP2 OK:", order)
+
+        # ================= STOP %100 =================
+        if side == "STOP" and pozisyondami and longPozisyonda:
+            pos_qty = abs(float(current_pos[0]["positionAmt"]))
+
+            order = exchange.create_market_sell_order(
+                symbol,
+                pos_qty,
+                {"reduceOnly": True}
+            )
+            print("STOP OK:", order)
+
+        return {"status": "success"}
+
+    except Exception as e:
+        print("HATA:", str(e))
+        return {"status": "error", "message": str(e)}, 500
