@@ -1,84 +1,80 @@
-from flask import Flask, request
-import json
-import pandas as pd
-import ccxt
+from flask import Flask, request, jsonify
+from binance.client import Client
+from binance.enums import *
+import math
 
 app = Flask(__name__)
 
-# pozisyon takibi (symbol bazlı)
-positions = {}
-
-def get_client(api_key, secret_key):
-    client = Client(api_key, secret_key)
-    client.FUTURES_URL = "https://testnet.binancefuture.com"
+def get_client(api_key, api_secret):
+    client = Client(api_key, api_secret)
+    client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
     return client
+
+def round_qty(qty, step):
+    return math.floor(qty / step) * step
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
 
-    signal = data.get("signal")
-    symbol = data.get("symbol")
-    api_key = data.get("apiKey")
-    secret_key = data.get("secretKey")
+    symbol = data["symbol"]
+    quantity = float(data["quantity"])
+    tp1 = float(data["tp1"])
+    tp2 = float(data["tp2"])
+    stop = float(data["stop"])
+    api_key = data["api_key"]
+    api_secret = data["api_secret"]
 
-    client = get_client(api_key, secret_key)
+    client = get_client(api_key, api_secret)
 
-    # ===== BUY =====
-    if signal == "BUY":
-        qty = float(data.get("qty"))
+    # LOT SIZE bilgisi
+    exchange_info = client.futures_exchange_info()
+    for s in exchange_info["symbols"]:
+        if s["symbol"] == symbol:
+            step_size = float(s["filters"][1]["stepSize"])
 
-        client.futures_create_order(
-            symbol=symbol,
-            side="BUY",
-            type="MARKET",
-            quantity=qty
-        )
+    quantity = round_qty(quantity, step_size)
 
-        positions[symbol] = qty
-        return jsonify({"status": "LONG OPENED", "qty": qty})
+    # === MARKET BUY (LONG) ===
+    client.futures_create_order(
+        symbol=symbol,
+        side=SIDE_BUY,
+        type=ORDER_TYPE_MARKET,
+        quantity=quantity
+    )
 
-    # ===== TP1 %50 =====
-    if signal == "TP1" and symbol in positions:
-        sell_qty = round(positions[symbol] * 0.5, 3)
+    # === TP1 %50 ===
+    client.futures_create_order(
+        symbol=symbol,
+        side=SIDE_SELL,
+        type=ORDER_TYPE_LIMIT,
+        price=tp1,
+        quantity=round_qty(quantity * 0.5, step_size),
+        timeInForce=TIME_IN_FORCE_GTC,
+        reduceOnly=True
+    )
 
-        client.futures_create_order(
-            symbol=symbol,
-            side="SELL",
-            type="MARKET",
-            quantity=sell_qty
-        )
+    # === TP2 %30 ===
+    client.futures_create_order(
+        symbol=symbol,
+        side=SIDE_SELL,
+        type=ORDER_TYPE_LIMIT,
+        price=tp2,
+        quantity=round_qty(quantity * 0.3, step_size),
+        timeInForce=TIME_IN_FORCE_GTC,
+        reduceOnly=True
+    )
 
-        positions[symbol] -= sell_qty
-        return jsonify({"status": "TP1 SOLD", "qty": sell_qty})
+    # === STOP %100 ===
+    client.futures_create_order(
+        symbol=symbol,
+        side=SIDE_SELL,
+        type=FUTURE_ORDER_TYPE_STOP_MARKET,
+        stopPrice=stop,
+        closePosition=True
+    )
 
-    # ===== TP2 %30 =====
-    if signal == "TP2" and symbol in positions:
-        sell_qty = round(positions[symbol] * 0.3, 3)
-
-        client.futures_create_order(
-            symbol=symbol,
-            side="SELL",
-            type="MARKET",
-            quantity=sell_qty
-        )
-
-        positions[symbol] -= sell_qty
-        return jsonify({"status": "TP2 SOLD", "qty": sell_qty})
-
-    # ===== STOP %100 =====
-    if signal == "STOP" and symbol in positions:
-        client.futures_create_order(
-            symbol=symbol,
-            side="SELL",
-            type="MARKET",
-            quantity=positions[symbol]
-        )
-
-        positions.pop(symbol)
-        return jsonify({"status": "POSITION CLOSED"})
-
-    return jsonify({"status": "NO ACTION"})
+    return jsonify({"status": "OK"}), 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run()
