@@ -2,3 +2,4 @@ flask
 gunicorn
 pandas
 ccxt
+python-binance==1.0.19
