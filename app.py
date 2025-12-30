@@ -1,5 +1,7 @@
-from flask import Flask, request, jsonify
-from binance.client import Client
+from flask import Flask, request
+import json
+import pandas as pd
+import ccxt
 
 app = Flask(__name__)
 
