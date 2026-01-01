@@ -29,6 +29,9 @@ bitget = ccxt.bitget({
 })
 bitget.set_sandbox_mode(True)
 
+# =============================
+# 📲 TELEGRAM
+# =============================
 def telegram(msg):
     try:
         requests.post(
@@ -39,80 +42,94 @@ def telegram(msg):
     except:
         pass
 
+# =============================
+# 🔁 SYMBOL FIX
+# =============================
 def tv_symbol_to_bitget(symbol):
     if not symbol:
-        raise ValueError("symbol boş geldi")
+        raise ValueError("symbol boş")
+    symbol = symbol.replace(".P", "")
     return symbol.replace("USDT", "/USDT:USDT")
 
+# =============================
+# 💰 USDT → AMOUNT
+# =============================
 def usdt_to_amount(symbol, usdt):
     price = bitget.fetch_ticker(symbol)["last"]
     return float(bitget.amount_to_precision(symbol, usdt / price))
 
+# =============================
+# 📌 AÇIK POZİSYON MİKTARI
+# =============================
+def get_open_amount(symbol):
+    positions = bitget.fetch_positions([symbol])
+    for p in positions:
+        if float(p["contracts"]) > 0:
+            return float(p["contracts"])
+    return 0
+
+# =============================
+# 🚀 WEBHOOK
+# =============================
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         raw = request.data.decode("utf-8").strip()
-        if not raw:
-            raise ValueError("Boş payload geldi")
-
         data = json.loads(raw)
 
-        print("GELEN RAW:", raw)
+        print("GELEN RAW:", data)
 
-        if data.get("action") != "BUY":
-            return jsonify({"status": "ignored"})
-
+        action = data.get("action")
         symbol_raw = data.get("symbol")
-        usdt = data.get("usdt")
-        tp1 = data.get("tp1")
-        tp2 = data.get("tp2")
-        sl  = data.get("sl")
-
-        if None in [symbol_raw, usdt, tp1, tp2, sl]:
-            raise ValueError(f"Eksik alan var: {data}")
 
         symbol = tv_symbol_to_bitget(symbol_raw)
 
-        usdt = float(usdt)
-        tp1 = float(tp1)
-        tp2 = float(tp2)
-        sl  = float(sl)
+        # ================= BUY =================
+        if action == "BUY":
+            usdt = float(data.get("usdt"))
+            amount = usdt_to_amount(symbol, usdt)
 
-        amount = usdt_to_amount(symbol, usdt)
+            bitget.create_market_buy_order(symbol, amount)
 
-        order = bitget.create_market_buy_order(symbol, amount)
-        entry = order["average"]
+            telegram(f"🟢 BUY\n{symbol}\nUSDT: {usdt}")
+            return jsonify({"status": "BUY OK"})
 
-        bitget.create_limit_sell_order(symbol, amount * 0.50, tp1)
-        bitget.create_limit_sell_order(symbol, amount * 0.30, tp2)
+        # ================= TP1 =================
+        if action == "TP1":
+            amount = get_open_amount(symbol) * 0.50
+            bitget.create_market_sell_order(
+                symbol, amount, params={"reduceOnly": True}
+            )
 
-        bitget.create_order(
-            symbol=symbol,
-            type="market",
-            side="sell",
-            amount=amount,
-            params={
-                "stopLossPrice": sl,
-                "reduceOnly": True
-            }
-        )
+            telegram(f"🎯 TP1 %50\n{symbol}")
+            return jsonify({"status": "TP1 OK"})
 
-        telegram(
-            f"🟢 LONG AÇILDI\n"
-            f"{symbol}\n"
-            f"Giriş: {entry}\n"
-            f"TP1: {tp1}\n"
-            f"TP2: {tp2}\n"
-            f"SL: {sl}"
-        )
+        # ================= TP2 =================
+        if action == "TP2":
+            amount = get_open_amount(symbol) * 0.30
+            bitget.create_market_sell_order(
+                symbol, amount, params={"reduceOnly": True}
+            )
 
-        return jsonify({"status": "ok"})
+            telegram(f"🎯 TP2 %30\n{symbol}")
+            return jsonify({"status": "TP2 OK"})
+
+        # ================= STOP =================
+        if action == "STOP":
+            amount = get_open_amount(symbol)
+            bitget.create_market_sell_order(
+                symbol, amount, params={"reduceOnly": True}
+            )
+
+            telegram(f"🛑 STOP\n{symbol}")
+            return jsonify({"status": "STOP OK"})
+
+        return jsonify({"status": "UNKNOWN ACTION"})
 
     except Exception as e:
-        telegram(f"❌ WEBHOOK HATASI:\n{str(e)}")
+        telegram(f"❌ HATA:\n{str(e)}")
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
