@@ -17,7 +17,6 @@ BITGET_PASSPHRASE = "93558287"
 TELEGRAM_TOKEN = "8143581645:AAF5figZLC0p7oC6AzjBTGzTfWtOFCdHzRo"
 TELEGRAM_CHAT_ID = "@gridsystem"
 
-
 # =============================
 # 🔌 BITGET
 # =============================
@@ -65,9 +64,11 @@ def usdt_to_amount(symbol, usdt):
 def get_open_amount(symbol):
     positions = bitget.fetch_positions([symbol])
     for p in positions:
-        if float(p["contracts"]) > 0:
-            return float(p["contracts"])
+        amt = float(p.get("contracts", 0))
+        if amt > 0:
+            return amt
     return 0.0
+
 
 # =============================
 # 🚀 WEBHOOK
@@ -83,22 +84,12 @@ def webhook():
         action = data.get("action")
         symbol_raw = data.get("symbol")
 
-        if not action or not symbol_raw:
-            return jsonify({"status": "INVALID PAYLOAD"}), 200
-
         symbol = tv_symbol_to_bitget(symbol_raw)
 
         # ================= BUY =================
         if action == "BUY":
-            usdt = float(data.get("usdt", 0))
-
-            if usdt <= 0:
-                return jsonify({"status": "BUY IGNORED – USDT YOK"}), 200
-
+            usdt = float(data.get("usdt"))
             amount = usdt_to_amount(symbol, usdt)
-
-            if amount <= 0:
-                return jsonify({"status": "BUY IGNORED – AMOUNT 0"}), 200
 
             bitget.create_market_buy_order(symbol, amount)
 
@@ -110,49 +101,57 @@ def webhook():
             open_amount = get_open_amount(symbol)
 
             if open_amount <= 0:
-                return jsonify({"status": "TP1 IGNORED – POZ YOK"}), 200
+                telegram(f"⚠️ TP1 geldi ama pozisyon yok\n{symbol}")
+                return jsonify({"status": "TP1 ignored"})
 
             amount = open_amount * 0.50
 
             bitget.create_market_sell_order(
-                symbol, amount, params={"reduceOnly": True}
+                symbol,
+                amount,
+                params={"reduceOnly": True}
             )
 
             telegram(f"🎯 TP1 %50\n{symbol}")
             return jsonify({"status": "TP1 OK"})
 
         # ================= TP2 =================
-        if action == "TP2":
+         if action == "TP2":
             open_amount = get_open_amount(symbol)
 
             if open_amount <= 0:
-                return jsonify({"status": "TP2 IGNORED – POZ YOK"}), 200
+                telegram(f"⚠️ TP2 geldi ama pozisyon yok\n{symbol}")
+                return jsonify({"status": "TP1 ignored"})
 
             amount = open_amount * 0.30
 
             bitget.create_market_sell_order(
-                symbol, amount, params={"reduceOnly": True}
+                symbol,
+                amount,
+                params={"reduceOnly": True}
             )
 
             telegram(f"🎯 TP2 %30\n{symbol}")
             return jsonify({"status": "TP2 OK"})
 
         # ================= STOP =================
-        if action == "STOP":
-            amount = get_open_amount(symbol)
+         if action == "STOP":
+            open_amount = get_open_amount(symbol)
 
-            if amount <= 0:
-                return jsonify({"status": "STOP IGNORED – POZ YOK"}), 200
+            if open_amount <= 0:
+                telegram(f"⚠️ STOP geldi ama pozisyon yok\n{symbol}")
+                return jsonify({"status": "STOP ignored"})
+
+            amount = open_amount * 0.20
 
             bitget.create_market_sell_order(
-                symbol, amount, params={"reduceOnly": True}
+                symbol,
+                amount,
+                params={"reduceOnly": True}
             )
 
-            telegram(f"🛑 STOP\n{symbol}")
+            telegram(f"🎯 STOP %20\n{symbol}")
             return jsonify({"status": "STOP OK"})
-
-        return jsonify({"status": "UNKNOWN ACTION"}), 200
-
     except Exception as e:
         telegram(f"❌ HATA:\n{str(e)}")
         return jsonify({"error": str(e)}), 500
@@ -161,8 +160,3 @@ def webhook():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
 
-        return jsonify({"error": str(e)}), 500
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
