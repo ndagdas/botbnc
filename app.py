@@ -4,129 +4,132 @@ import requests
 
 app = Flask(__name__)
 
-# ==================================================
-# BITGET DEMO (SANDBOX) AYARLARI
-# ==================================================
+# =============================
+# 🔑 BITGET DEMO API
+# =============================
+BITGET_API_KEY = "bg_ef42d04183294d11782767ded8b560dc"
+BITGET_SECRET_KEY = "d883d8324fa83575bc4de104f9fc2ea229e3110e40d150d673408350b56769fe"
+BITGET_PASSPHRASE = "93558287"
+
+# =============================
+# 📲 TELEGRAM
+# =============================
+TELEGRAM_TOKEN = "8143581645:AAF5figZLC0p7oC6AzjBTGzTfWtOFCdHzRo"
+TELEGRAM_CHAT_ID = "@gridsystem"
+
+# =============================
+# 🔌 BITGET
+# =============================
 bitget = ccxt.bitget({
-    'apiKey': 'bg_ef42d04183294d11782767ded8b560dc',
-    'secret': 'd883d8324fa83575bc4de104f9fc2ea229e3110e40d150d673408350b56769fe',
-    'password': '93558287',
+    'apiKey': BITGET_API_KEY,
+    'secret': BITGET_SECRET_KEY,
+    'password': BITGET_PASSPHRASE,
     'enableRateLimit': True,
-    'options': {
-        'defaultType': 'swap'  # USDT-M Futures
-    }
+    'options': {'defaultType': 'swap'}
 })
 
-bitget.set_sandbox_mode(True)  # ✅ DEMO MODE
+bitget.set_sandbox_mode(True)  # DEMO
 
-# ==================================================
-# TELEGRAM AYARLARI
-# ==================================================
-TELEGRAM_TOKEN = "8143581645:AAF5figZLC0p7oC6AzjBTGzTfWtOFCdHzRo"
-CHAT_ID = "@gridsystem"
-
-def telegram(message: str):
+# =============================
+# 📲 TELEGRAM
+# =============================
+def telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, json={
-        "chat_id": CHAT_ID,
-        "text": message
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg
     })
 
-# ==================================================
-# YARDIMCI FONKSİYONLAR
-# ==================================================
-def tv_symbol_to_bitget(symbol: str) -> str:
-    # BTCUSDT -> BTC/USDT:USDT
+# =============================
+# 🔁 SYMBOL FIX
+# =============================
+def tv_symbol_to_bitget(symbol):
+    if not symbol:
+        raise ValueError("symbol boş geldi")
     return symbol.replace("USDT", "/USDT:USDT")
 
-def usdt_to_amount(symbol: str, usdt: float) -> float:
-    ticker = bitget.fetch_ticker(symbol)
-    price = ticker["last"]
+# =============================
+# 💰 USDT → AMOUNT
+# =============================
+def usdt_to_amount(symbol, usdt):
+    price = bitget.fetch_ticker(symbol)["last"]
     amount = usdt / price
-    return round(amount, 6)
+    return float(bitget.amount_to_precision(symbol, amount))
 
-def get_long_position(symbol: str):
-    positions = bitget.fetch_positions([symbol])
-    for p in positions:
-        if p["side"] == "long" and float(p["contracts"]) > 0:
-            return p
-    return None
-
-# ==================================================
-# WEBHOOK
-# ==================================================
+# =============================
+# 🚀 WEBHOOK
+# =============================
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
-    action = data.get("action")
-    symbol = tv_symbol_to_bitget(data.get("symbol"))
-
     try:
-        # ================= BUY (LONG ONLY) =================
-        if action == "BUY":
-            usdt = float(data["usdt"])
-            amount = usdt_to_amount(symbol, usdt)
+        data = request.get_json(force=True)
 
-            # Aynı anda tek LONG (koruma)
-            if get_long_position(symbol):
-                return jsonify({"status": "already in position"})
+        # 🔒 ZORUNLU ALANLAR
+        required = ["action", "symbol", "usdt", "tp1", "tp2", "sl"]
+        for r in required:
+            if r not in data:
+                raise ValueError(f"{r} JSON içinde yok")
 
-            bitget.create_market_buy_order(symbol, amount)
+        if data["action"] != "BUY":
+            return jsonify({"status": "ignored"})
 
-            telegram(
-                f"🟢 LONG AÇILDI\n"
-                f"{symbol}\n"
-                f"USDT: {usdt}\n"
-                f"Miktar: {amount}"
-            )
+        symbol = tv_symbol_to_bitget(data["symbol"])
+        usdt   = float(data["usdt"])
+        tp1    = float(data["tp1"])
+        tp2    = float(data["tp2"])
+        sl     = float(data["sl"])
 
-        # ================= TP1 %50 =================
-        elif action == "TP1":
-            pos = get_long_position(symbol)
-            if pos:
-                qty = float(pos["contracts"]) * 0.50
-                bitget.create_market_sell_order(symbol, qty)
+        amount = usdt_to_amount(symbol, usdt)
 
-                telegram(
-                    f"🎯 TP1 (%50)\n"
-                    f"{symbol}\n"
-                    f"Kapanan: {round(qty, 6)}"
-                )
+        # 🟢 MARKET BUY
+        order = bitget.create_market_buy_order(symbol, amount)
+        entry = order["average"]
 
-        # ================= TP2 %30 =================
-        elif action == "TP2":
-            pos = get_long_position(symbol)
-            if pos:
-                qty = float(pos["contracts"]) * 0.30
-                bitget.create_market_sell_order(symbol, qty)
+        # 🎯 TP1 (%50)
+        bitget.create_limit_sell_order(
+            symbol,
+            amount * 0.50,
+            tp1
+        )
 
-                telegram(
-                    f"🎯 TP2 (%30)\n"
-                    f"{symbol}\n"
-                    f"Kapanan: {round(qty, 6)}"
-                )
+        # 🎯 TP2 (%30)
+        bitget.create_limit_sell_order(
+            symbol,
+            amount * 0.30,
+            tp2
+        )
 
-        # ================= STOP (FULL EXIT) =================
-        elif action == "STOP":
-            pos = get_long_position(symbol)
-            if pos:
-                qty = float(pos["contracts"])
-                bitget.create_market_sell_order(symbol, qty)
+        # 🛑 STOP LOSS (%100)
+        bitget.create_order(
+            symbol=symbol,
+            type="market",
+            side="sell",
+            amount=amount,
+            params={
+                "stopLossPrice": sl,
+                "reduceOnly": True
+            }
+        )
 
-                telegram(
-                    f"🛑 STOP LOSS\n"
-                    f"{symbol}\n"
-                    f"Kapanan: {round(qty, 6)}"
-                )
-
-        else:
-            return jsonify({"error": "invalid action"})
+        telegram(
+            f"🟢 LONG AÇILDI\n"
+            f"{symbol}\n"
+            f"Giriş: {entry}\n"
+            f"USDT: {usdt}\n\n"
+            f"🎯 TP1: {tp1}\n"
+            f"🎯 TP2: {tp2}\n"
+            f"🛑 SL: {sl}"
+        )
 
         return jsonify({"status": "ok"})
 
     except Exception as e:
-        telegram(f"❌ HATA\n{str(e)}")
-        return jsonify({"error": str(e)})
+        telegram(f"❌ HATA:\n{str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
 
 # ==================================================
 # APP RUN
