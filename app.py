@@ -1,140 +1,135 @@
-from flask import Flask, request
-import json
-import pandas as pd
+from flask import Flask, request, jsonify
 import ccxt
-
-longPozisyonda = False
-shortPozisyonda = False
-pozisyondami = False
+import requests
 
 app = Flask(__name__)
 
-@app.route("/webhook", methods=['POST'])
+# ==================================================
+# BITGET DEMO (SANDBOX) AYARLARI
+# ==================================================
+bitget = ccxt.bitget({
+    'apiKey': 'bg_ef42d04183294d11782767ded8b560dc',
+    'secret': 'd883d8324fa83575bc4de104f9fc2ea229e3110e40d150d673408350b56769fe',
+    'password': '93558287',
+    'enableRateLimit': True,
+    'options': {
+        'defaultType': 'swap'  # USDT-M Futures
+    }
+})
+
+bitget.set_sandbox_mode(True)  # ✅ DEMO MODE
+
+# ==================================================
+# TELEGRAM AYARLARI
+# ==================================================
+TELEGRAM_TOKEN = "8143581645:AAF5figZLC0p7oC6AzjBTGzTfWtOFCdHzRo"
+CHAT_ID = "@gridsystem"
+
+def telegram(message: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(url, json={
+        "chat_id": CHAT_ID,
+        "text": message
+    })
+
+# ==================================================
+# YARDIMCI FONKSİYONLAR
+# ==================================================
+def tv_symbol_to_bitget(symbol: str) -> str:
+    # BTCUSDT -> BTC/USDT:USDT
+    return symbol.replace("USDT", "/USDT:USDT")
+
+def usdt_to_amount(symbol: str, usdt: float) -> float:
+    ticker = bitget.fetch_ticker(symbol)
+    price = ticker["last"]
+    amount = usdt / price
+    return round(amount, 6)
+
+def get_long_position(symbol: str):
+    positions = bitget.fetch_positions([symbol])
+    for p in positions:
+        if p["side"] == "long" and float(p["contracts"]) > 0:
+            return p
+    return None
+
+# ==================================================
+# WEBHOOK
+# ==================================================
+@app.route("/webhook", methods=["POST"])
 def webhook():
+    data = request.json
+    action = data.get("action")
+    symbol = tv_symbol_to_bitget(data.get("symbol"))
+
     try:
-        data = json.loads(request.data)
-        print("Gelen Webhook Verisi:", data)
+        # ================= BUY (LONG ONLY) =================
+        if action == "BUY":
+            usdt = float(data["usdt"])
+            amount = usdt_to_amount(symbol, usdt)
 
-        ticker = data.get('ticker', '')
-        veri = ticker.split(".")
-        symbol = veri[0] if veri else ''
+            # Aynı anda tek LONG (koruma)
+            if get_long_position(symbol):
+                return jsonify({"status": "already in position"})
 
-        price = float(data.get('price', 0))
-        islem = data.get('side', '')
-        quantity = float(data.get('quantity', 0))
+            bitget.create_market_buy_order(symbol, amount)
 
-        binanceapi = data.get('binanceApiKey', '')
-        binancesecret = data.get('binanceSecretKey', '')
+            telegram(
+                f"🟢 LONG AÇILDI\n"
+                f"{symbol}\n"
+                f"USDT: {usdt}\n"
+                f"Miktar: {amount}"
+            )
 
-        exchange = ccxt.binance({
-            'apiKey': binanceapi,
-            'secret': binancesecret,
-            'options': {
-                'adjustForTimeDifference': True,
-                'defaultType': 'future'
-            },
-            'enableRateLimit': True
-        })
+        # ================= TP1 %50 =================
+        elif action == "TP1":
+            pos = get_long_position(symbol)
+            if pos:
+                qty = float(pos["contracts"]) * 0.50
+                bitget.create_market_sell_order(symbol, qty)
 
-        balance = exchange.fetch_balance()
-        positions = balance['info'].get('positions', [])
-        current_positions = [
-            p for p in positions
-            if float(p['positionAmt']) != 0 and p['symbol'] == symbol
-        ]
+                telegram(
+                    f"🎯 TP1 (%50)\n"
+                    f"{symbol}\n"
+                    f"Kapanan: {round(qty, 6)}"
+                )
 
-        position_bilgi = pd.DataFrame(current_positions)
+        # ================= TP2 %30 =================
+        elif action == "TP2":
+            pos = get_long_position(symbol)
+            if pos:
+                qty = float(pos["contracts"]) * 0.30
+                bitget.create_market_sell_order(symbol, qty)
 
-        global pozisyondami, longPozisyonda, shortPozisyonda
+                telegram(
+                    f"🎯 TP2 (%30)\n"
+                    f"{symbol}\n"
+                    f"Kapanan: {round(qty, 6)}"
+                )
 
-        if not position_bilgi.empty:
-            pozisyondami = True
-            pos_amt = float(position_bilgi.iloc[-1]['positionAmt'])
-            longPozisyonda = pos_amt > 0
-            shortPozisyonda = pos_amt < 0
+        # ================= STOP (FULL EXIT) =================
+        elif action == "STOP":
+            pos = get_long_position(symbol)
+            if pos:
+                qty = float(pos["contracts"])
+                bitget.create_market_sell_order(symbol, qty)
+
+                telegram(
+                    f"🛑 STOP LOSS\n"
+                    f"{symbol}\n"
+                    f"Kapanan: {round(qty, 6)}"
+                )
+
         else:
-            pozisyondami = False
-            longPozisyonda = False
-            shortPozisyonda = False
+            return jsonify({"error": "invalid action"})
 
-        print(f"İşlem: {islem}, Symbol: {symbol}, Fiyat: {price}, Miktar: {quantity}")
-
-        # ================= BUY =================
-        if islem == "BUY":
-            if not longPozisyonda:
-                if shortPozisyonda:
-                    exchange.create_market_buy_order(
-                        symbol,
-                        abs(float(position_bilgi.iloc[-1]['positionAmt'])),
-                        {"reduceOnly": True}
-                    )
-
-                alinacak_miktar = quantity / price
-                order = exchange.create_market_buy_order(symbol, alinacak_miktar)
-                print("BUY Order Başarılı:", order)
-
-        # ================= SELL (kullanılmıyor ama dursun) =================
-        if islem == "SELL":
-            if not shortPozisyonda:
-                if longPozisyonda:
-                    exchange.create_market_sell_order(
-                        symbol,
-                        float(position_bilgi.iloc[-1]['positionAmt']),
-                        {"reduceOnly": True}
-                    )
-
-                alinacak_miktar = quantity / price
-                order = exchange.create_market_sell_order(symbol, alinacak_miktar)
-                print("SELL Order Başarılı:", order)
-
-        # ================= TP1 → %50 KAR =================
-        if islem == "TP1" and pozisyondami:
-            pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
-            alinacak = pozisyon_miktari * 0.50
-
-            if longPozisyonda:
-                order = exchange.create_market_sell_order(
-                    symbol, alinacak, {"reduceOnly": True}
-                )
-            if shortPozisyonda:
-                order = exchange.create_market_buy_order(
-                    symbol, alinacak, {"reduceOnly": True}
-                )
-
-            print("TP1 (%50) KAR Order Başarılı:", order)
-
-        # ================= TP2 → %30 KAR =================
-        if islem == "TP2" and pozisyondami:
-            pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
-            alinacak = pozisyon_miktari * 0.50
-
-            if longPozisyonda:
-                order = exchange.create_market_sell_order(
-                    symbol, alinacak, {"reduceOnly": True}
-                )
-            if shortPozisyonda:
-                order = exchange.create_market_buy_order(
-                    symbol, alinacak, {"reduceOnly": True}
-                )
-
-            print("TP2 (%30) KAR Order Başarılı:", order)
-
-        # ================= STOP → KALAN %20 =================
-        if islem == "STOP" and pozisyondami:
-            pozisyon_miktari = abs(float(position_bilgi.iloc[-1]['positionAmt']))
-
-            if longPozisyonda:
-                order = exchange.create_market_sell_order(
-                    symbol, pozisyon_miktari, {"reduceOnly": True}
-                )
-            if shortPozisyonda:
-                order = exchange.create_market_buy_order(
-                    symbol, pozisyon_miktari, {"reduceOnly": True}
-                )
-
-            print("STOP Order Başarılı:", order)
+        return jsonify({"status": "ok"})
 
     except Exception as e:
-        print("Hata:", str(e))
+        telegram(f"❌ HATA\n{str(e)}")
+        return jsonify({"error": str(e)})
 
-    return {"code": "success"}
+# ==================================================
+# APP RUN
+# ==================================================
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=9000)
