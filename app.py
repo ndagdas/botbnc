@@ -138,9 +138,3 @@ def webhook():
         print("Hata:", str(e))
 
     return {"code": "success"}
-
-
-
-
-
-kod yapısını bozmadan düzeltmeyi yaparmısın
