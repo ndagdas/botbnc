@@ -1,5 +1,5 @@
-flask
-gunicorn
-pandas
-ccxt
-python-binance==1.0.19
+Flask==3.0.0
+pandas==2.2.0
+ccxt==4.2.55
+gunicorn==21.2.0
+requests==2.31.0
