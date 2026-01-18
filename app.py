@@ -17,10 +17,35 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Telegram Bot Konfigürasyonu
-TELEGRAM_BOT_TOKEN = os.environ.get('8143581645:AAF5figZLC0p7oC6AzjBTGzTfWtOFCdHzRo', '')
-TELEGRAM_CHAT_ID = os.environ.get('@sosyopump', '')
-TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# TELEGRAM AYARLARI - BURAYI KENDİ BİLGİLERİNİZLE DOLDURUN!
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+# Telegram Bot Token - @BotFather'dan alın
+TELEGRAM_BOT_TOKEN = "8143581645:AAF5figZLC0p7oC6AzjBTGzTfWtOFCdHzRo"  # <-- BURAYA KENDİ BOT TOKEN'INI YAZ
+
+# Telegram Chat ID - Botunuza mesaj gönderip https://api.telegram.org/bot<TOKEN>/getUpdates adresinden alın
+TELEGRAM_CHAT_ID = "@sosyopump"  # <-- BURAYA KENDİ CHAT ID'NI YAZ
+
+# Telegram bildirimlerini aktif et (True/False)
+TELEGRAM_ENABLED = True  # Telegram bildirimlerini kapatmak için False yapın
+
+# Binance Testnet API Key'leri (Opsiyonel - Webhook'tan da gelebilir)
+DEFAULT_BINANCE_API_KEY = ""  # <-- Varsayılan API Key (boş bırakabilirsiniz)
+DEFAULT_BINANCE_SECRET_KEY = ""  # <-- Varsayılan Secret Key (boş bırakabilirsiniz)
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# AYARLAR SONU - AŞAĞIDAKİ KODU DEĞİŞTİRMEYİN!
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+# Telegram kontrol
+if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "7223290234:AAFTO2sB6bWk4y59jBpJTUwJ49K09d3Qk5s":
+    logger.warning("⚠️  Telegram bot token ayarlanmamış! Lütfen yukarıdaki TELEGRAM_BOT_TOKEN değerini güncelleyin.")
+    TELEGRAM_ENABLED = False
+
+if not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == "6848467128":
+    logger.warning("⚠️  Telegram chat ID ayarlanmamış! Lütfen yukarıdaki TELEGRAM_CHAT_ID değerini güncelleyin.")
+    TELEGRAM_ENABLED = False
 
 class TelegramNotifier:
     """Telegram bildirim sınıfı"""
@@ -29,7 +54,7 @@ class TelegramNotifier:
     def send_message(message, parse_mode='HTML'):
         """Telegram'a mesaj gönder"""
         if not TELEGRAM_ENABLED:
-            logger.warning("Telegram bot token veya chat ID ayarlanmamış")
+            logger.warning("Telegram bildirimleri kapalı")
             return False
         
         try:
@@ -41,16 +66,18 @@ class TelegramNotifier:
                 'disable_web_page_preview': True
             }
             
+            logger.info(f"Telegram mesajı gönderiliyor: {message[:100]}...")
             response = requests.post(url, json=payload, timeout=10)
+            
             if response.status_code == 200:
-                logger.info("Telegram mesajı gönderildi")
+                logger.info("✅ Telegram mesajı başarıyla gönderildi")
                 return True
             else:
-                logger.error(f"Telegram mesaj gönderme hatası: {response.text}")
+                logger.error(f"❌ Telegram mesaj gönderme hatası: {response.text}")
                 return False
                 
         except Exception as e:
-            logger.error(f"Telegram mesaj gönderme hatası: {e}")
+            logger.error(f"❌ Telegram mesaj gönderme hatası: {e}")
             return False
     
     @staticmethod
@@ -139,45 +166,6 @@ class TelegramNotifier:
         except Exception as e:
             logger.error(f"Telegram hata bildirimi hatası: {e}")
             return False
-    
-    @staticmethod
-    def send_position_update(position_info, action="update"):
-        """Pozisyon güncelleme bildirimi"""
-        try:
-            if not position_info.get('exists', False):
-                return False
-            
-            symbol = position_info.get('symbol', 'N/A')
-            side = position_info.get('side', 'N/A')
-            amount = position_info.get('amount', 0)
-            entry_price = position_info.get('entry_price', 0)
-            
-            side_emoji = "📈" if side == 'long' else "📉"
-            action_emoji = "🔄" if action == "update" else "✅" if action == "closed" else "🚀"
-            
-            message = f"""
-{action_emoji} <b>POSITION {action.upper()}</b> {action_emoji}
-
-<b>Symbol:</b> {symbol}
-<b>Side:</b> {side_emoji} {side.upper()}
-<b>Amount:</b> {amount:.8f}
-<b>Entry Price:</b> ${entry_price:,.8f}
-
-⏰ <i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
-"""
-            
-            thread = threading.Thread(
-                target=TelegramNotifier.send_message,
-                args=(message,)
-            )
-            thread.daemon = True
-            thread.start()
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Telegram pozisyon bildirimi hatası: {e}")
-            return False
 
 def parse_tradingview_data(data):
     """TradingView verisini parse et"""
@@ -212,8 +200,22 @@ def parse_tradingview_data(data):
         except:
             parsed['quantity_usdt'] = 100.0
         
-        parsed['api_key'] = data.get('binanceApiKey') or data.get('binance_api_key') or data.get('api_key', '')
-        parsed['secret_key'] = data.get('binanceSecretKey') or data.get('binance_secret_key') or data.get('secret_key', '')
+        # API key'leri al (önce istekten, sonra varsayılan, sonra ortam değişkeni)
+        parsed['api_key'] = (
+            data.get('binanceApiKey') or 
+            data.get('binance_api_key') or 
+            data.get('api_key') or
+            DEFAULT_BINANCE_API_KEY or
+            os.environ.get('BINANCE_API_KEY', '')
+        )
+        
+        parsed['secret_key'] = (
+            data.get('binanceSecretKey') or 
+            data.get('binance_secret_key') or 
+            data.get('secret_key') or
+            DEFAULT_BINANCE_SECRET_KEY or
+            os.environ.get('BINANCE_SECRET_KEY', '')
+        )
         
         testnet = data.get('testnet', True)
         if isinstance(testnet, str):
@@ -225,7 +227,6 @@ def parse_tradingview_data(data):
         
     except Exception as e:
         logger.error(f"Parse error: {e}")
-        TelegramNotifier.send_error_notification(f"Parse error: {e}", data)
         return {
             'symbol': 'BTCUSDT',
             'price': 0.0,
@@ -266,26 +267,36 @@ def init_binance_client(api_key, secret_key, testnet=True):
             exchange.set_sandbox_mode(True)
         
         exchange.load_markets()
-        exchange.fetch_time()
         
         logger.info(f"Binance client initialized successfully. Testnet: {testnet}")
         
-        # Telegram bildirimi
+        # Telegram bildirimi (sadece ilk başlatmada)
         if TELEGRAM_ENABLED:
             mode = "TESTNET" if testnet else "REAL ACCOUNT"
-            TelegramNotifier.send_message(f"🤖 <b>Binance Bot Started</b>\n\nMode: {mode}\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            welcome_msg = f"""
+🤖 <b>Binance Trading Bot Started</b> 🤖
+
+✅ <b>Status:</b> Online
+🌐 <b>Mode:</b> {mode}
+⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+<i>Ready to receive TradingView signals!</i>
+"""
+            TelegramNotifier.send_message(welcome_msg)
         
         return exchange, None
         
     except ccxt.AuthenticationError as e:
         error_msg = f"API Authentication failed: {str(e)}"
         logger.error(error_msg)
-        TelegramNotifier.send_error_notification(error_msg)
+        if TELEGRAM_ENABLED:
+            TelegramNotifier.send_error_notification(error_msg)
         return None, error_msg
     except Exception as e:
         error_msg = f"Failed to initialize Binance client: {str(e)}"
         logger.error(error_msg)
-        TelegramNotifier.send_error_notification(error_msg)
+        if TELEGRAM_ENABLED:
+            TelegramNotifier.send_error_notification(error_msg)
         return None, error_msg
 
 def get_position_info(exchange, symbol):
@@ -316,28 +327,22 @@ def get_position_info(exchange, symbol):
         
     except Exception as e:
         logger.error(f"Position info error: {e}")
-        TelegramNotifier.send_error_notification(f"Position info error: {e}")
         return {'exists': False, 'amount': 0, 'side': None, 'symbol': symbol}
 
-def execute_order(exchange, symbol, side, quantity, reduce_only=False, order_type='market'):
+def execute_order(exchange, symbol, side, quantity, reduce_only=False):
     """Emir gönder"""
     try:
         params = {}
         if reduce_only:
             params['reduceOnly'] = True
         
-        if order_type == 'market':
-            if side.upper() in ['BUY', 'LONG']:
-                order = exchange.create_market_buy_order(symbol, quantity, params)
-                action = "BUY"
-            elif side.upper() in ['SELL', 'SHORT']:
-                order = exchange.create_market_sell_order(symbol, quantity, params)
-                action = "SELL"
-            else:
-                return None
+        if side.upper() in ['BUY', 'LONG']:
+            order = exchange.create_market_buy_order(symbol, quantity, params)
+            action = "BUY"
+        elif side.upper() in ['SELL', 'SHORT']:
+            order = exchange.create_market_sell_order(symbol, quantity, params)
+            action = "SELL"
         else:
-            # Limit order için
-            # Not: Bu örnekte sadece market order kullanıyoruz
             return None
         
         logger.info(f"Order executed: {action} {quantity} {symbol}")
@@ -351,8 +356,8 @@ def execute_order(exchange, symbol, side, quantity, reduce_only=False, order_typ
 <b>Symbol:</b> {symbol}
 <b>Action:</b> {action}
 <b>Quantity:</b> {quantity:.8f}
-<b>Type:</b> {order_type.upper()}
 <b>Order ID:</b> {order.get('id', 'N/A')}
+<b>Status:</b> {order.get('status', 'N/A')}
 
 ⏰ <i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
 """
@@ -360,20 +365,11 @@ def execute_order(exchange, symbol, side, quantity, reduce_only=False, order_typ
         
         return order
         
-    except ccxt.InsufficientFunds as e:
-        error_msg = f"Insufficient funds: {str(e)}"
-        logger.error(error_msg)
-        TelegramNotifier.send_error_notification(error_msg)
-        return None
-    except ccxt.NetworkError as e:
-        error_msg = f"Network error: {str(e)}"
-        logger.error(error_msg)
-        TelegramNotifier.send_error_notification(error_msg)
-        return None
     except Exception as e:
         error_msg = f"Order execution error: {str(e)}"
         logger.error(error_msg)
-        TelegramNotifier.send_error_notification(error_msg)
+        if TELEGRAM_ENABLED:
+            TelegramNotifier.send_error_notification(error_msg)
         return None
 
 def calculate_quantity(exchange, symbol, usdt_amount, price):
@@ -423,13 +419,7 @@ def webhook():
             raw_data = request.data.decode('utf-8')
             data = json.loads(raw_data)
         
-        logger.info(f"Raw TradingView Data: {json.dumps(data, indent=2)}")
-        
-        # Telegram bildirimi - Sinyal alındı
-        if TELEGRAM_ENABLED:
-            ticker = data.get('ticker', 'N/A')
-            side = data.get('side', 'N/A')
-            TelegramNotifier.send_message(f"📨 <b>Signal Received</b>\n\nTicker: {ticker}\nAction: {side}")
+        logger.info(f"📨 Webhook received: {json.dumps(data, indent=2)}")
         
         # 2. Parse et
         tv_data = parse_tradingview_data(data)
@@ -438,7 +428,8 @@ def webhook():
         if not tv_data['api_key'] or not tv_data['secret_key']:
             error_msg = "API keys missing in request"
             logger.error(error_msg)
-            TelegramNotifier.send_error_notification(error_msg, tv_data)
+            if TELEGRAM_ENABLED:
+                TelegramNotifier.send_error_notification(error_msg, tv_data)
             return jsonify({
                 'status': 'error',
                 'message': error_msg,
@@ -453,7 +444,8 @@ def webhook():
         )
         
         if error:
-            TelegramNotifier.send_error_notification(f"Binance connection failed: {error}", tv_data)
+            if TELEGRAM_ENABLED:
+                TelegramNotifier.send_error_notification(f"Binance connection failed: {error}", tv_data)
             return jsonify({
                 'status': 'error',
                 'message': f'Binance connection failed: {error}',
@@ -469,10 +461,11 @@ def webhook():
         if symbol not in exchange.markets:
             error_msg = f"Symbol {symbol} not available on Binance"
             logger.error(error_msg)
-            TelegramNotifier.send_error_notification(error_msg, tv_data)
+            if TELEGRAM_ENABLED:
+                TelegramNotifier.send_error_notification(error_msg, tv_data)
             
             # Popüler sembolleri listele
-            popular = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT']
+            popular = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT', 'XRPUSDT']
             available = [s for s in popular if s in exchange.markets]
             
             return jsonify({
@@ -501,7 +494,6 @@ def webhook():
                 close_result = execute_order(exchange, symbol, 'BUY', close_qty, reduce_only=True)
                 if close_result:
                     result = {'status': 'success', 'message': 'Closed short position and opened new long'}
-                    TelegramNotifier.send_position_update(position_info, "closed")
                 else:
                     result = {'status': 'error', 'message': 'Failed to close short position'}
             
@@ -509,10 +501,6 @@ def webhook():
             order_result = execute_order(exchange, symbol, 'BUY', quantity)
             if order_result:
                 result = {'status': 'success', 'message': 'Opened long position'}
-                # Yeni pozisyon bilgisi al
-                new_position = get_position_info(exchange, symbol)
-                if new_position['exists']:
-                    TelegramNotifier.send_position_update(new_position, "opened")
             else:
                 result = {'status': 'error', 'message': 'Failed to open long position'}
             
@@ -523,7 +511,6 @@ def webhook():
                 close_result = execute_order(exchange, symbol, 'SELL', close_qty, reduce_only=True)
                 if close_result:
                     result = {'status': 'success', 'message': 'Closed long position and opened new short'}
-                    TelegramNotifier.send_position_update(position_info, "closed")
                 else:
                     result = {'status': 'error', 'message': 'Failed to close long position'}
             
@@ -531,9 +518,6 @@ def webhook():
             order_result = execute_order(exchange, symbol, 'SELL', quantity)
             if order_result:
                 result = {'status': 'success', 'message': 'Opened short position'}
-                new_position = get_position_info(exchange, symbol)
-                if new_position['exists']:
-                    TelegramNotifier.send_position_update(new_position, "opened")
             else:
                 result = {'status': 'error', 'message': 'Failed to open short position'}
             
@@ -547,10 +531,6 @@ def webhook():
             
             if order_result:
                 result = {'status': 'success', 'message': 'Take Profit 1 executed (50%)'}
-                # Pozisyon güncelle
-                updated_position = get_position_info(exchange, symbol)
-                if updated_position['exists']:
-                    TelegramNotifier.send_position_update(updated_position, "updated")
             else:
                 result = {'status': 'error', 'message': 'Failed to execute TP1'}
                 
@@ -564,9 +544,6 @@ def webhook():
             
             if order_result:
                 result = {'status': 'success', 'message': 'Take Profit 2 executed (30%)'}
-                updated_position = get_position_info(exchange, symbol)
-                if updated_position['exists']:
-                    TelegramNotifier.send_position_update(updated_position, "updated")
             else:
                 result = {'status': 'error', 'message': 'Failed to execute TP2'}
                 
@@ -580,7 +557,6 @@ def webhook():
             
             if order_result:
                 result = {'status': 'success', 'message': 'Stop loss executed (100%)'}
-                TelegramNotifier.send_position_update(position_info, "closed")
             else:
                 result = {'status': 'error', 'message': 'Failed to execute stop loss'}
                 
@@ -594,7 +570,6 @@ def webhook():
             
             if order_result:
                 result = {'status': 'success', 'message': 'All positions closed'}
-                TelegramNotifier.send_position_update(position_info, "closed")
             else:
                 result = {'status': 'error', 'message': 'Failed to close all positions'}
         else:
@@ -615,7 +590,7 @@ def webhook():
             'timestamp': datetime.now().isoformat()
         }
         
-        logger.info(f"Webhook processed successfully: {response}")
+        logger.info(f"✅ Webhook processed successfully: {response}")
         
         # 12. Telegram'a sonuç bildirimi gönder
         if TELEGRAM_ENABLED:
@@ -626,7 +601,8 @@ def webhook():
     except json.JSONDecodeError as e:
         error_msg = f"JSON decode error: {str(e)}"
         logger.error(error_msg)
-        TelegramNotifier.send_error_notification(error_msg)
+        if TELEGRAM_ENABLED:
+            TelegramNotifier.send_error_notification(error_msg)
         return jsonify({
             'status': 'error',
             'message': error_msg,
@@ -636,7 +612,8 @@ def webhook():
     except Exception as e:
         error_msg = f"Webhook error: {str(e)}"
         logger.error(f"{error_msg}\n{traceback.format_exc()}")
-        TelegramNotifier.send_error_notification(error_msg)
+        if TELEGRAM_ENABLED:
+            TelegramNotifier.send_error_notification(error_msg)
         return jsonify({
             'status': 'error',
             'message': error_msg,
@@ -647,14 +624,20 @@ def webhook():
 def index():
     """Ana sayfa"""
     return jsonify({
-        'service': 'Binance Futures Trading Bot with Telegram Notifications',
-        'version': '2.0',
+        'service': 'Binance Futures Trading Bot with Telegram',
+        'version': '2.1',
         'telegram_enabled': TELEGRAM_ENABLED,
         'endpoints': {
             'POST /webhook': 'TradingView webhook endpoint',
             'GET /telegram-test': 'Test Telegram notifications',
             'GET /status': 'Bot status',
             'GET /health': 'Health check'
+        },
+        'settings': {
+            'telegram_bot_token_set': bool(TELEGRAM_BOT_TOKEN),
+            'telegram_chat_id_set': bool(TELEGRAM_CHAT_ID),
+            'default_api_key_set': bool(DEFAULT_BINANCE_API_KEY),
+            'testnet_mode': True
         },
         'timestamp': datetime.now().isoformat()
     })
@@ -665,19 +648,22 @@ def telegram_test():
     if not TELEGRAM_ENABLED:
         return jsonify({
             'status': 'error',
-            'message': 'Telegram not configured',
-            'instructions': 'Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables'
+            'message': 'Telegram not enabled',
+            'current_token': TELEGRAM_BOT_TOKEN[:10] + '...' if TELEGRAM_BOT_TOKEN else 'Not set',
+            'current_chat_id': TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID else 'Not set',
+            'instructions': 'Please update TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the code'
         }), 400
     
     test_message = f"""
 🔔 <b>Telegram Bot Test</b> 🔔
 
-This is a test message from your Binance Trading Bot.
-
 ✅ <b>Bot Status:</b> Online
+🤖 <b>Bot Name:</b> Binance Trading Bot
 ⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
 
 If you receive this message, Telegram notifications are working correctly!
+
+<i>This is an automated test message.</i>
 """
     
     success = TelegramNotifier.send_message(test_message)
@@ -685,13 +671,15 @@ If you receive this message, Telegram notifications are working correctly!
     if success:
         return jsonify({
             'status': 'success',
-            'message': 'Telegram test message sent',
+            'message': 'Telegram test message sent successfully!',
+            'telegram_enabled': TELEGRAM_ENABLED,
             'timestamp': datetime.now().isoformat()
         })
     else:
         return jsonify({
             'status': 'error',
             'message': 'Failed to send Telegram message',
+            'telegram_enabled': TELEGRAM_ENABLED,
             'timestamp': datetime.now().isoformat()
         }), 500
 
@@ -701,7 +689,10 @@ def status():
     return jsonify({
         'status': 'running',
         'telegram_enabled': TELEGRAM_ENABLED,
-        'telegram_configured': bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        'telegram_token_set': bool(TELEGRAM_BOT_TOKEN),
+        'telegram_chat_id_set': bool(TELEGRAM_CHAT_ID),
+        'default_api_key_set': bool(DEFAULT_BINANCE_API_KEY),
+        'server_time': datetime.now().isoformat(),
         'timestamp': datetime.now().isoformat()
     })
 
@@ -710,34 +701,57 @@ def health():
     """Health check"""
     return jsonify({
         'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'telegram': 'enabled' if TELEGRAM_ENABLED else 'disabled'
+        'telegram': 'enabled' if TELEGRAM_ENABLED else 'disabled',
+        'server_time': datetime.now().isoformat(),
+        'timestamp': datetime.now().isoformat()
     })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('DEBUG', 'false').lower() == 'true'
     
-    logger.info("=" * 60)
-    logger.info("BINANCE FUTURES BOT WITH TELEGRAM NOTIFICATIONS")
-    logger.info(f"Port: {port}")
-    logger.info(f"Telegram Enabled: {TELEGRAM_ENABLED}")
-    logger.info("=" * 60)
+    print("=" * 70)
+    print("🤖 BINANCE FUTURES TRADING BOT WITH TELEGRAM")
+    print("=" * 70)
     
+    # Telegram durumu
     if TELEGRAM_ENABLED:
-        logger.info("✅ Telegram notifications are ENABLED")
-        # Başlangıç mesajı gönder
-        try:
-            TelegramNotifier.send_message(
-                f"🤖 <b>Binance Trading Bot Started</b>\n\n"
-                f"✅ Bot is now online and ready to receive TradingView signals.\n"
-                f"⏰ Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-                f"🌐 URL: https://{os.environ.get('HEROKU_APP_NAME', 'localhost')}.herokuapp.com"
-            )
-        except Exception as e:
-            logger.error(f"Failed to send startup Telegram message: {e}")
+        print("✅ Telegram notifications: ENABLED")
+        print(f"   Bot Token: {TELEGRAM_BOT_TOKEN[:10]}...{TELEGRAM_BOT_TOKEN[-5:]}")
+        print(f"   Chat ID: {TELEGRAM_CHAT_ID}")
     else:
-        logger.warning("⚠️ Telegram notifications are DISABLED")
-        logger.info("To enable Telegram, set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables")
+        print("⚠️  Telegram notifications: DISABLED")
+        print("   To enable, update TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the code")
+    
+    # Binance API durumu
+    if DEFAULT_BINANCE_API_KEY:
+        print(f"✅ Default Binance API Key: {DEFAULT_BINANCE_API_KEY[:10]}...")
+    else:
+        print("⚠️  Default Binance API Key: Not set")
+        print("   You can set it in DEFAULT_BINANCE_API_KEY variable or send via webhook")
+    
+    print(f"🌐 Webhook URL: http://localhost:{port}/webhook")
+    print(f"🔧 Debug Mode: {debug}")
+    print("=" * 70)
+    print("📨 Ready to receive TradingView alerts!")
+    print("=" * 70)
+    
+    # Başlangıç mesajı gönder
+    if TELEGRAM_ENABLED:
+        startup_msg = f"""
+🚀 <b>Binance Trading Bot Started</b> 🚀
+
+✅ <b>Status:</b> Online and Ready
+🌐 <b>Server:</b> Heroku
+⏰ <b>Start Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+<b>Configuration:</b>
+• Telegram: ✅ Enabled
+• Testnet Mode: ✅ Active
+• Webhook: ✅ Ready
+
+<i>Waiting for TradingView signals...</i>
+"""
+        TelegramNotifier.send_message(startup_msg)
     
     app.run(host='0.0.0.0', port=port, debug=debug, threaded=True)
