@@ -78,7 +78,7 @@ def parse_tradingview_data(data):
         parsed['secret_key'] = data.get('binanceSecretKey') or data.get('binance_secret_key') or data.get('secret_key', '')
         
         # Testnet modu
-        testnet = data.get('testnet', True)
+        testnet = data.get('testnet', False)
         if isinstance(testnet, str):
             testnet = testnet.lower() in ['true', '1', 'yes']
         parsed['testnet'] = testnet
@@ -97,10 +97,10 @@ def parse_tradingview_data(data):
             'quantity_usdt': 100.0,
             'api_key': '',
             'secret_key': '',
-            'testnet': True
+            'testnet': False
         }
 
-def init_binance_client(api_key, secret_key, testnet=True):
+def init_binance_client(api_key, secret_key, testnet=False):
     """Binance Futures client başlat - TradingView uyumlu"""
     try:
         config = {
@@ -231,7 +231,7 @@ def webhook():
             return jsonify({
                 'status': 'error',
                 'message': f'Binance connection failed: {error}',
-                'hint': 'Check if you are using TESTNET API keys for testnet=true',
+                'hint': 'Check if you are using TESTNET API keys for testnet=False',
                 'timestamp': datetime.now().isoformat()
             }), 400
         
