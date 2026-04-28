@@ -182,7 +182,7 @@ def process_signal(data):
                 ticker = exchange.fetch_ticker(symbol)
                 price = ticker["last"]
 
-            quantity = d["quantity_usdt"] / price
+            quantity = d["quantity_usdt"]
 
             market = exchange.market(symbol)
             min_qty = market["limits"]["amount"]["min"]
