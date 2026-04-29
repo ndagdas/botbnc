@@ -14,7 +14,7 @@ def fix_symbol(symbol):
     return symbol
 
 def get_exchange(api, secret):
-    return ccxt.binance({
+    exchange = ccxt.binance({
         'apiKey': api,
         'secret': secret,
         'options': {
@@ -23,6 +23,10 @@ def get_exchange(api, secret):
         },
         'enableRateLimit': True
     })
+
+    exchange.set_sandbox_mode(True) 
+
+    return exchange
 
 def get_position(exchange, symbol):
     balance = exchange.fetch_balance()
