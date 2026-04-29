@@ -1,137 +1,137 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request
 import json
 import ccxt
-import time
-import threading
-from queue import Queue
-
-# ---------------------------------
-# CONFIG
-# ---------------------------------
-RETRY = 3
-DELAY = 0.5
-DUPLICATE_WINDOW = 2
-
-processed = {}
-q = Queue()
 
 app = Flask(__name__)
 
 # ---------------------------------
-# DUPLICATE
+# HELPER
 # ---------------------------------
-def is_duplicate(signal_id):
-    now = time.time()
-    if signal_id in processed:
-        if now - processed[signal_id] < DUPLICATE_WINDOW:
-            return True
-    processed[signal_id] = now
-    return False
+def fix_symbol(symbol):
+    symbol = symbol.replace(".P", "")
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    return symbol
 
-# ---------------------------------
-# WORKER
-# ---------------------------------
-def worker():
-    while True:
-        data = q.get()
-        process(data)
+def get_exchange(api, secret):
+    return ccxt.binance({
+        'apiKey': api,
+        'secret': secret,
+        'options': {
+            'adjustForTimeDifference': True,
+            'defaultType': 'future'
+        },
+        'enableRateLimit': True
+    })
 
-threading.Thread(target=worker, daemon=True).start()
+def get_position(exchange, symbol):
+    balance = exchange.fetch_balance()
+    positions = balance['info'].get('positions', [])
 
-# ---------------------------------
-# PROCESS
-# ---------------------------------
-def process(data):
+    for p in positions:
+        if p['symbol'] == symbol:
+            amt = float(p['positionAmt'])
+            if amt != 0:
+                return amt
 
-    for i in range(RETRY):
-        try:
-            ticker = data.get('ticker', '')
-            symbol = ticker.split(".")[0]
-
-            price = float(data.get('price', 0))
-            side = data.get('side', '')
-            usdt = float(data.get('quantity', 100))
-            signal_id = data.get("id", str(time.time()))
-
-            api = data.get('binanceApiKey')
-            secret = data.get('binanceSecretKey')
-
-            if is_duplicate(signal_id):
-                return
-
-            exchange = ccxt.binance({
-                'apiKey': api,
-                'secret': secret,
-                'options': {'defaultType': 'future'},
-                'enableRateLimit': True
-            })
-
-            balance = exchange.fetch_balance()
-            positions = balance['info']['positions']
-
-            pos_amt = 0
-            for p in positions:
-                if p['symbol'] == symbol:
-                    pos_amt = float(p['positionAmt'])
-
-            # fiyat yoksa çek
-            if price <= 0:
-                ticker_data = exchange.fetch_ticker(symbol)
-                price = ticker_data['last']
-
-            qty = usdt / price
-
-            # ---------------- ENTRY ----------------
-            if side == "BUY":
-                if pos_amt < 0:
-                    exchange.create_market_buy_order(symbol, abs(pos_amt), {"reduceOnly": True})
-
-                exchange.create_market_buy_order(symbol, qty)
-                print(f"BUY {symbol} {qty}")
-
-            elif side == "SELL":
-                if pos_amt > 0:
-                    exchange.create_market_sell_order(symbol, pos_amt, {"reduceOnly": True})
-
-                exchange.create_market_sell_order(symbol, qty)
-                print(f"SELL {symbol} {qty}")
-
-            # ---------------- TP ----------------
-            elif side == "TP1":
-                if pos_amt > 0:
-                    exchange.create_market_sell_order(symbol, pos_amt * 0.5, {"reduceOnly": True})
-
-            elif side == "TP2":
-                if pos_amt > 0:
-                    exchange.create_market_sell_order(symbol, pos_amt * 0.3, {"reduceOnly": True})
-
-            # ---------------- STOP ----------------
-            elif side == "STOP":
-                if pos_amt > 0:
-                    exchange.create_market_sell_order(symbol, pos_amt, {"reduceOnly": True})
-                elif pos_amt < 0:
-                    exchange.create_market_buy_order(symbol, abs(pos_amt), {"reduceOnly": True})
-
-            return
-
-        except Exception as e:
-            print(f"Retry {i+1}: {e}")
-            time.sleep(DELAY)
-
-    print("FAILED:", data)
+    return 0
 
 # ---------------------------------
 # WEBHOOK
 # ---------------------------------
 @app.route("/webhook", methods=['POST'])
 def webhook():
-    data = request.get_json()
-    q.put(data)
-    return jsonify({"status": "queued"})
+    try:
+        data = json.loads(request.data)
+
+        print("GELEN:", data)
+
+        symbol = fix_symbol(data.get("ticker", "BTCUSDT"))
+        side = data.get("side")
+        price = float(data.get("price", 0))
+        usdt = float(data.get("quantity", 100))
+
+        api = data.get("binanceApiKey")
+        secret = data.get("binanceSecretKey")
+
+        exchange = get_exchange(api, secret)
+
+        if price <= 0:
+            ticker = exchange.fetch_ticker(symbol)
+            price = ticker["last"]
+
+        position_amt = get_position(exchange, symbol)
+
+        print(f"{symbol} | {side} | price={price} | usdt={usdt} | pos={position_amt}")
+
+        # ---------------------------------
+        # BUY
+        # ---------------------------------
+        if side == "BUY":
+            if position_amt < 0:
+                exchange.create_market_buy_order(symbol, abs(position_amt), {"reduceOnly": True})
+
+            if position_amt <= 0:
+                qty = usdt / price
+                exchange.create_market_buy_order(symbol, qty)
+                print("BUY OK")
+
+        # ---------------------------------
+        # SELL (SHORT)
+        # ---------------------------------
+        elif side == "SELL":
+            if position_amt > 0:
+                exchange.create_market_sell_order(symbol, position_amt, {"reduceOnly": True})
+
+            if position_amt >= 0:
+                qty = usdt / price
+                exchange.create_market_sell_order(symbol, qty)
+                print("SELL OK")
+
+        # ---------------------------------
+        # TP1
+        # ---------------------------------
+        elif side == "TP1":
+            if position_amt > 0:
+                exchange.create_market_sell_order(symbol, position_amt * 0.5, {"reduceOnly": True})
+                print("TP1 LONG")
+
+            elif position_amt < 0:
+                exchange.create_market_buy_order(symbol, abs(position_amt) * 0.5, {"reduceOnly": True})
+                print("TP1 SHORT")
+
+        # ---------------------------------
+        # TP2
+        # ---------------------------------
+        elif side == "TP2":
+            if position_amt > 0:
+                exchange.create_market_sell_order(symbol, position_amt * 0.3, {"reduceOnly": True})
+                print("TP2 LONG")
+
+            elif position_amt < 0:
+                exchange.create_market_buy_order(symbol, abs(position_amt) * 0.3, {"reduceOnly": True})
+                print("TP2 SHORT")
+
+        # ---------------------------------
+        # STOP / CLOSE
+        # ---------------------------------
+        elif side in ["STOP", "CLOSE"]:
+            if position_amt > 0:
+                exchange.create_market_sell_order(symbol, position_amt, {"reduceOnly": True})
+                print("STOP LONG")
+
+            elif position_amt < 0:
+                exchange.create_market_buy_order(symbol, abs(position_amt), {"reduceOnly": True})
+                print("STOP SHORT")
+
+        return {"status": "ok"}
+
+    except Exception as e:
+        print("HATA:", str(e))
+        return {"error": str(e)}
 
 # ---------------------------------
 # RUN
 # ---------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-```
