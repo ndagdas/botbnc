@@ -37,7 +37,7 @@ processed_signals = {}
 def parse_data(data):
     return {
         "id": data.get("id"),
-        "symbol": data.get("ticker", "").replace(".P", "") + "USDT",
+        "symbol": data.get("ticker", "").replace(".P", ""),
         "side": data.get("side"),
         "price": float(data.get("price", 0)),
         "stopPrice": float(data.get("stopPrice", 0)),
