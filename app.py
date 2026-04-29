@@ -31,16 +31,6 @@ app = Flask(__name__)
 signal_queue = Queue()
 processed_signals = {}
 
-def normalize_symbol(ticker: str):
-    ticker = ticker.replace(".P", "").upper()
-
-    if ticker.endswith("USDTUSDT"):
-        return ticker.replace("USDTUSDT", "USDT")
-
-    if ticker.endswith("USDT"):
-        return ticker
-
-    return ticker + "USDT"
 # ---------------------------------
 # PARSE
 # ---------------------------------
