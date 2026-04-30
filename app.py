@@ -12,14 +12,8 @@ app = Flask(__name__)
 signal_queue = Queue()
 
 # ---------------------------------
-# HELPER
+# EXCHANGE
 # ---------------------------------
-def fix_symbol(symbol):
-    symbol = symbol.replace(".P", "")
-    if not symbol.endswith("USDT"):
-        symbol += "USDT"
-    return symbol
-
 def get_exchange(api, secret):
     exchange = ccxt.binance({
         'apiKey': api,
@@ -34,17 +28,40 @@ def get_exchange(api, secret):
     exchange.set_sandbox_mode(True)
     return exchange
 
+# ---------------------------------
+# SYMBOL RESOLVE (FIX)
+# ---------------------------------
+def resolve_symbol(exchange, raw_symbol):
+    s = raw_symbol.replace(".P", "")
+
+    if s in exchange.markets:
+        return s
+
+    if s + "USDT" in exchange.markets:
+        return s + "USDT"
+
+    if s.replace("USDT", "") + "/USDT" in exchange.markets:
+        return s.replace("USDT", "") + "/USDT"
+
+    return None
+
+# ---------------------------------
+# POSITION
+# ---------------------------------
 def get_position(exchange, symbol):
     balance = exchange.fetch_balance()
     positions = balance['info'].get('positions', [])
 
     for p in positions:
-        if p['symbol'] == symbol:
+        if p['symbol'] == symbol.replace("/", ""):
             amt = float(p['positionAmt'])
             if amt != 0:
                 return amt
     return 0
 
+# ---------------------------------
+# QTY CALC (FIX)
+# ---------------------------------
 def calculate_qty(exchange, symbol, usdt, price):
     market = exchange.market(symbol)
 
@@ -58,13 +75,13 @@ def calculate_qty(exchange, symbol, usdt, price):
     return qty
 
 # ---------------------------------
-# CORE PROCESS
+# CORE LOGIC
 # ---------------------------------
 def process_signal(data):
     try:
         print("GELEN:", data)
 
-        symbol = fix_symbol(data.get("ticker", "BTCUSDT"))
+        raw_symbol = data.get("ticker", "BTCUSDT")
         side = data.get("side")
         price = float(data.get("price", 0))
         usdt = float(data.get("quantity", 100))
@@ -75,8 +92,10 @@ def process_signal(data):
         exchange = get_exchange(api, secret)
         exchange.load_markets()
 
-        if symbol not in exchange.markets:
-            print(f"INVALID SYMBOL: {symbol}")
+        symbol = resolve_symbol(exchange, raw_symbol)
+
+        if symbol is None:
+            print(f"SKIP INVALID SYMBOL: {raw_symbol}")
             return
 
         if price <= 0:
@@ -100,7 +119,7 @@ def process_signal(data):
                 print(f"BUY OK | qty={qty}")
 
         # ---------------------------------
-        # SELL (SHORT)
+        # SELL
         # ---------------------------------
         elif side == "SELL":
             if position_amt > 0:
@@ -136,7 +155,7 @@ def process_signal(data):
                 print("TP2 SHORT")
 
         # ---------------------------------
-        # STOP / CLOSE
+        # STOP
         # ---------------------------------
         elif side in ["STOP", "CLOSE"]:
             if position_amt > 0:
@@ -150,9 +169,8 @@ def process_signal(data):
     except Exception as e:
         print("HATA:", str(e))
 
-
 # ---------------------------------
-# WORKER THREAD
+# WORKER
 # ---------------------------------
 def worker():
     while True:
@@ -162,16 +180,14 @@ def worker():
 threading.Thread(target=worker, daemon=True).start()
 
 # ---------------------------------
-# WEBHOOK (FAST RESPONSE)
+# WEBHOOK (FAST)
 # ---------------------------------
 @app.route("/webhook", methods=['POST'])
 def webhook():
     data = json.loads(request.data)
 
-    # queue'ya at
     signal_queue.put(data)
 
-    # anında cevap dön (timeout çözümü)
     return {"status": "ok"}
 
 # ---------------------------------
