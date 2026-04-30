@@ -1,8 +1,15 @@
 from flask import Flask, request
 import json
 import ccxt
+import threading
+from queue import Queue
 
 app = Flask(__name__)
+
+# ---------------------------------
+# QUEUE
+# ---------------------------------
+signal_queue = Queue()
 
 # ---------------------------------
 # HELPER
@@ -24,8 +31,7 @@ def get_exchange(api, secret):
         'enableRateLimit': True
     })
 
-    exchange.set_sandbox_mode(True) 
-
+    exchange.set_sandbox_mode(True)
     return exchange
 
 def get_position(exchange, symbol):
@@ -37,17 +43,25 @@ def get_position(exchange, symbol):
             amt = float(p['positionAmt'])
             if amt != 0:
                 return amt
-
     return 0
 
-# ---------------------------------
-# WEBHOOK
-# ---------------------------------
-@app.route("/webhook", methods=['POST'])
-def webhook():
-    try:
-        data = json.loads(request.data)
+def calculate_qty(exchange, symbol, usdt, price):
+    market = exchange.market(symbol)
 
+    raw_qty = usdt / price
+    min_qty = market['limits']['amount']['min']
+    precision = market['precision']['amount']
+
+    qty = max(raw_qty, min_qty)
+    qty = round(qty, precision)
+
+    return qty
+
+# ---------------------------------
+# CORE PROCESS
+# ---------------------------------
+def process_signal(data):
+    try:
         print("GELEN:", data)
 
         symbol = fix_symbol(data.get("ticker", "BTCUSDT"))
@@ -59,6 +73,11 @@ def webhook():
         secret = data.get("binanceSecretKey")
 
         exchange = get_exchange(api, secret)
+        exchange.load_markets()
+
+        if symbol not in exchange.markets:
+            print(f"INVALID SYMBOL: {symbol}")
+            return
 
         if price <= 0:
             ticker = exchange.fetch_ticker(symbol)
@@ -76,17 +95,10 @@ def webhook():
                 exchange.create_market_buy_order(symbol, abs(position_amt), {"reduceOnly": True})
 
             if position_amt <= 0:
-                market = exchange.market(symbol)
-
-                raw_qty = usdt / price
-                min_qty = market['limits']['amount']['min']
-                precision = market['precision']['amount']
-
-                qty = max(raw_qty, min_qty)
-                qty = round(qty, precision)
-
+                qty = calculate_qty(exchange, symbol, usdt, price)
                 exchange.create_market_buy_order(symbol, qty)
                 print(f"BUY OK | qty={qty}")
+
         # ---------------------------------
         # SELL (SHORT)
         # ---------------------------------
@@ -95,17 +107,10 @@ def webhook():
                 exchange.create_market_sell_order(symbol, position_amt, {"reduceOnly": True})
 
             if position_amt >= 0:
-                market = exchange.market(symbol)
-
-                raw_qty = usdt / price
-                min_qty = market['limits']['amount']['min']
-                precision = market['precision']['amount']
-
-                qty = max(raw_qty, min_qty)
-                qty = round(qty, precision)
-
+                qty = calculate_qty(exchange, symbol, usdt, price)
                 exchange.create_market_sell_order(symbol, qty)
                 print(f"SELL OK | qty={qty}")
+
         # ---------------------------------
         # TP1
         # ---------------------------------
@@ -142,11 +147,32 @@ def webhook():
                 exchange.create_market_buy_order(symbol, abs(position_amt), {"reduceOnly": True})
                 print("STOP SHORT")
 
-        return {"status": "ok"}
-
     except Exception as e:
         print("HATA:", str(e))
-        return {"error": str(e)}
+
+
+# ---------------------------------
+# WORKER THREAD
+# ---------------------------------
+def worker():
+    while True:
+        data = signal_queue.get()
+        process_signal(data)
+
+threading.Thread(target=worker, daemon=True).start()
+
+# ---------------------------------
+# WEBHOOK (FAST RESPONSE)
+# ---------------------------------
+@app.route("/webhook", methods=['POST'])
+def webhook():
+    data = json.loads(request.data)
+
+    # queue'ya at
+    signal_queue.put(data)
+
+    # anında cevap dön (timeout çözümü)
+    return {"status": "ok"}
 
 # ---------------------------------
 # RUN
