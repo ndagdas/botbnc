@@ -1,411 +1,349 @@
-import os
 import json
 import logging
+import threading
+import time
+import sys
+import math
+import requests
 from flask import Flask, request, jsonify
 import ccxt
-from datetime import datetime
-import traceback
 
-# Log ayarları
+# ------------------- KONFİGÜRASYON -------------------
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# TradingView formatına uygun parse fonksiyonu
-def parse_tradingview_data(data):
-    """
-    TradingView'den gelen JSON'u standart formata çevir
-    TradingView formatı:
-    {
-        "ticker": "BTCUSDT.P",  # .P futures anlamında
-        "price": "50000.5",     # String olarak gelir
-        "side": "BUY",          # BUY, SELL, TP1, TP2, STOP
-        "quantity": "100",      # USDT cinsinden, string
-        "binanceApiKey": "...",
-        "binanceSecretKey": "..."
-    }
-    """
-    parsed = {}
+# Aktif işlemler: key = (api_key, coin)  -> değer = Trade object
+active_trades = {}
+trade_lock = threading.Lock()
+
+# ------------------- YARDIMCI FONKSİYONLAR -------------------
+def send_telegram(telegram_token, chat_id, message):
+    """Telegram mesajı gönderir"""
+    if not telegram_token or not chat_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+        data = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+        requests.post(url, json=data, timeout=5)
+    except Exception as e:
+        logger.error(f"Telegram hatası: {e}")
+
+def create_futures_client(api_key, api_secret, testnet=False):
+    """CCXT kullanarak Binance Futures istemcisi oluşturur"""
+    exchange = ccxt.binance({
+        'apiKey': api_key,
+        'secret': api_secret,
+        'options': {
+            'defaultType': 'future',  # Futures piyasasını işaret et
+        },
+        'enableRateLimit': True,
+    })
+    if testnet:
+        exchange.set_sandbox_mode(True)  # Testnet modu
+    return exchange
+
+def set_leverage(exchange, symbol, leverage):
+    """Belirtilen sembol için kaldıraç oranını ayarlar"""
+    try:
+        # Binance Futures için kaldıraç ayarlama endpoint'i
+        exchange.fapiPrivate_post_leverage({
+            'symbol': symbol.replace('/', ''),  # örn: 'BTC/USDT' -> 'BTCUSDT'
+            'leverage': leverage
+        })
+        logger.info(f"✅ Kaldıraç {leverage}x olarak ayarlandı: {symbol}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Kaldıraç ayarlanamadı {symbol}: {e}")
+        return False
+
+def calculate_position_size(client, coin, usdt_amount, leverage, stop_percent, risk_percent):
+    """Risk yönetimine göre pozisyon büyüklüğünü hesaplar"""
+    ticker = client.fetch_ticker(coin)
+    entry_price = ticker['last']
     
-    try:
-        # Ticker/Symbol
-        ticker = data.get('ticker', '')
-        if '.' in ticker:
-            parsed['symbol'] = ticker.split('.')[0]
-        else:
-            parsed['symbol'] = ticker
-        
-        # Price - string'den float'a çevir
-        price_str = data.get('price', '0')
-        try:
-            parsed['price'] = float(price_str)
-        except:
-            parsed['price'] = 0.0
-        
-        # Side/İşlem - TradingView 'side' gönderiyor
-        side = data.get('side', '').upper()
-        parsed['side'] = side
-        
-        # TradingView'den gelen isimlendirmeleri eşle
-        # TradingView'deki 'side' -> bizim 'islem' alanımız
-        side_mapping = {
-            'BUY': 'BUY',
-            'SELL': 'SELL', 
-            'LONG': 'BUY',
-            'SHORT': 'SELL',
-            'TP1': 'TP1',
-            'TP2': 'TP2',
-            'STOP': 'STOP',
-            'CLOSE': 'CLOSE_ALL',
-            'CLOSE_ALL': 'CLOSE_ALL',
-            'EXIT': 'CLOSE_ALL'
-        }
-        parsed['islem'] = side_mapping.get(side, side)
-        
-        # Quantity - USDT cinsinden, string'den float'a
-        quantity_str = data.get('quantity', '100')  # Varsayılan 100 USDT
-        try:
-            parsed['quantity_usdt'] = float(quantity_str)
-        except:
-            parsed['quantity_usdt'] = 100.0
-        
-        # API Key'ler - TradingView 'binanceApiKey' ve 'binanceSecretKey' gönderiyor
-        parsed['api_key'] = data.get('binanceApiKey') or data.get('binance_api_key') or data.get('api_key', '')
-        parsed['secret_key'] = data.get('binanceSecretKey') or data.get('binance_secret_key') or data.get('secret_key', '')
-        
-        # Testnet modu
-        testnet = data.get('testnet', true)
-        if isinstance(testnet, str):
-            testnet = testnet.lower() in ['true', '1', 'yes']
-        parsed['testnet'] = testnet
-        
-        logger.info(f"Parsed TradingView data: {parsed}")
-        return parsed
-        
-    except Exception as e:
-        logger.error(f"TradingView data parse error: {e}")
-        # Varsayılan değerlerle devam et
-        return {
-            'symbol': 'BTCUSDT',
-            'price': 0.0,
-            'side': 'BUY',
-            'islem': 'BUY',
-            'quantity_usdt': 100.0,
-            'api_key': '',
-            'secret_key': '',
-            'testnet': False
-        }
+    # Risk hesaplama: risk oranına göre pozisyon büyüklüğü
+    # Önce kullanıcının futures cüzdanındaki bakiyeyi al
+    balance = client.fetch_balance()
+    usdt_balance = balance['total'].get('USDT', 0)
+    
+    if usdt_balance <= 0:
+        raise ValueError("Futures cüzdanında USDT bakiyesi bulunamadı!")
+    
+    # Risk yönetimi: hesap bakiyesinin risk_oranı kadarını riske et
+    risk_amount = usdt_balance * (risk_percent / 100)
+    
+    # Stop loss mesafesi (yüzde olarak girilen değer)
+    stop_distance_percent = stop_percent / 100
+    stop_loss_price = entry_price * (1 - stop_distance_percent)
+    stop_distance_usdt = entry_price - stop_loss_price
+    
+    # Pozisyon büyüklüğü = Risk edilen miktar / Stop loss mesafesi (USDT cinsinden)
+    position_size = risk_amount / stop_distance_usdt
+    
+    # Kaldıraç uygulanmış marjin miktarı
+    margin = position_size / leverage
+    
+    # Kullanıcının belirttiği USDT miktarını aşmasın
+    if margin > usdt_amount:
+        margin = usdt_amount
+        position_size = margin * leverage
+    
+    logger.info(f"💰 Hesap bakiyesi: {usdt_balance} USDT | Risk: {risk_amount} USDT")
+    logger.info(f"🎯 Hesaplanan pozisyon: {position_size} {coin} (Marjin: {margin} USDT)")
+    
+    return position_size, margin, entry_price
 
-def init_binance_client(api_key, secret_key, testnet=False):
-    """Binance Futures client başlat - TradingView uyumlu"""
+def place_futures_order(client, coin, side, quantity, position_side):
+    """Futures piyasa emri gönderir (Long/Short)"""
     try:
-        config = {
-            'apiKey': api_key.strip(),
-            'secret': secret_key.strip(),
-            'options': {
-                'defaultType': 'future',
-                'adjustForTimeDifference': True
-            },
-            'enableRateLimit': True,
-        }
-        
-        if testnet:
-            # TESTNET için
-            config['urls'] = {
-                'api': {
-                    'public': 'https://testnet.binancefuture.com/fapi/v1',
-                    'private': 'https://testnet.binancefuture.com/fapi/v1'
-                }
+        # CCXT ile futures market order
+        order = client.create_order(
+            symbol=coin,
+            type='market',
+            side=side,
+            amount=quantity,
+            params={
+                'positionSide': position_side  # LONG veya SHORT
             }
-            logger.info("Using Binance Testnet Futures")
-        
-        exchange = ccxt.binance(config)
-        
-        # Testnet modunu aç
-        if testnet:
-            exchange.set_sandbox_mode(True)
-        
-        # Markets yükle
-        exchange.load_markets()
-        
-        # Bağlantı testi
-        exchange.fetch_time()
-        
-        logger.info(f"Binance client initialized successfully. Testnet: {testnet}")
-        return exchange, None
-        
-    except ccxt.AuthenticationError as e:
-        error_msg = f"API Authentication failed: {str(e)}"
-        logger.error(error_msg)
-        return None, error_msg
-    except Exception as e:
-        error_msg = f"Failed to initialize Binance client: {str(e)}"
-        logger.error(error_msg)
-        return None, error_msg
-
-def get_position_info(exchange, symbol):
-    """Mevcut pozisyon bilgilerini al"""
-    try:
-        if not symbol.endswith('USDT'):
-            symbol = f"{symbol}USDT"
-        
-        positions = exchange.fetch_positions([symbol])
-        
-        for pos in positions:
-            position_amt = float(pos.get('contracts', 0))
-            if position_amt != 0:
-                return {
-                    'exists': True,
-                    'amount': abs(position_amt),
-                    'side': 'long' if position_amt > 0 else 'short',
-                    'entry_price': float(pos.get('entryPrice', 0)),
-                    'symbol': symbol
-                }
-        
-        return {'exists': False, 'amount': 0, 'side': None, 'symbol': symbol}
-        
-    except Exception as e:
-        logger.error(f"Position info error: {e}")
-        return {'exists': False, 'amount': 0, 'side': None, 'symbol': symbol}
-
-def execute_order(exchange, symbol, side, quantity, reduce_only=False):
-    """Emir gönder"""
-    try:
-        params = {}
-        if reduce_only:
-            params['reduceOnly'] = True
-        
-        if side.upper() in ['BUY', 'LONG']:
-            order = exchange.create_market_buy_order(symbol, quantity, params)
-        elif side.upper() in ['SELL', 'SHORT']:
-            order = exchange.create_market_sell_order(symbol, quantity, params)
-        else:
-            return None
-        
-        logger.info(f"Order executed: {side} {quantity} {symbol}")
+        )
+        logger.info(f"✅ {side} {position_side} emri: {quantity} {coin} - {order}")
         return order
-        
     except Exception as e:
-        logger.error(f"Order execution error: {e}")
-        return None
+        logger.error(f"❌ Emir hatası: {e}")
+        raise
 
+# ------------------- İŞLEM YÖNETİCİSİ SINIFI -------------------
+class TradeMonitor:
+    """Açık bir pozisyonu TP/SL için izler"""
+    def __init__(self, client, telegram_token, chat_id, trade_id, coin, position_side, 
+                 entry_price, quantity, tp1_price, tp2_price, stop_price,
+                 tp1_quantity, tp2_quantity):
+        self.client = client
+        self.telegram_token = telegram_token
+        self.chat_id = chat_id
+        self.trade_id = trade_id
+        self.coin = coin
+        self.position_side = position_side
+        self.entry_price = entry_price
+        self.total_quantity = quantity
+        self.remaining_quantity = quantity
+        self.tp1_price = tp1_price
+        self.tp2_price = tp2_price
+        self.stop_price = stop_price
+        self.tp1_qty = tp1_quantity
+        self.tp2_qty = tp2_quantity
+        self.tp1_triggered = False
+        self.tp2_triggered = False
+        self.closed = False
+        
+        self._send_notification(f"🟢 **Yeni {position_side} İşlem Açıldı**\n"
+                                f"Coin: {coin}\n"
+                                f"Miktar: {quantity}\n"
+                                f"Giriş: {entry_price}\n"
+                                f"TP1: {tp1_price} (satılacak: {tp1_qty})\n"
+                                f"TP2: {tp2_price} (satılacak: {tp2_qty})\n"
+                                f"Stop: {stop_price}")
+
+    def _send_notification(self, message):
+        send_telegram(self.telegram_token, self.chat_id, message)
+
+    def _close_position(self, quantity, reason):
+        """Pozisyonu kapat (Long ise sell, Short ise buy)"""
+        if quantity <= 0 or self.remaining_quantity <= 0:
+            return
+        qty = min(quantity, self.remaining_quantity)
+        try:
+            side = 'sell' if self.position_side == 'LONG' else 'buy'
+            order = place_futures_order(self.client, self.coin, side, qty, self.position_side)
+            self.remaining_quantity -= qty
+            self._send_notification(f"{reason}\n💰 Kapatılan: {qty} {self.coin}\n📊 Kalan: {self.remaining_quantity}")
+            if self.remaining_quantity <= 0:
+                self.closed = True
+                self._send_notification(f"✅ {self.coin} işlemi tamamen kapatıldı.")
+        except Exception as e:
+            self._send_notification(f"❌ Kapatma hatası: {str(e)[:100]}")
+
+    def execute_tp1(self):
+        if not self.tp1_triggered and self.remaining_quantity > 0:
+            self.tp1_triggered = True
+            self._close_position(self.tp1_qty, "📈 **TP1 gerçekleşti** (yarısı kapatıldı)")
+
+    def execute_tp2(self):
+        if self.tp1_triggered and not self.tp2_triggered and self.remaining_quantity > 0:
+            self.tp2_triggered = True
+            self._close_position(self.tp2_qty, "📈 **TP2 gerçekleşti** (kalanın %30'u kapatıldı)")
+
+    def execute_stop(self):
+        if not self.closed and self.remaining_quantity > 0:
+            self._close_position(self.remaining_quantity, "🛑 **Stop Loss tetiklendi** (tümü kapatıldı)")
+            self.closed = True
+
+    def monitor(self):
+        """Her saniye fiyatı kontrol eden döngü"""
+        while not self.closed and self.remaining_quantity > 0:
+            try:
+                ticker = self.client.fetch_ticker(self.coin)
+                price = ticker['last']
+                
+                # LONG pozisyon için fiyat kontrolü
+                if self.position_side == 'LONG':
+                    if not self.tp1_triggered and price >= self.tp1_price:
+                        self.execute_tp1()
+                    elif self.tp1_triggered and not self.tp2_triggered and price >= self.tp2_price:
+                        self.execute_tp2()
+                    elif price <= self.stop_price:
+                        self.execute_stop()
+                else:  # SHORT pozisyon
+                    if not self.tp1_triggered and price <= self.tp1_price:
+                        self.execute_tp1()
+                    elif self.tp1_triggered and not self.tp2_triggered and price <= self.tp2_price:
+                        self.execute_tp2()
+                    elif price >= self.stop_price:
+                        self.execute_stop()
+                        
+            except Exception as e:
+                logger.error(f"Monitör hatası {self.coin}: {e}")
+            time.sleep(1)
+
+# ------------------- WEBHOOK ANA İŞLEYİCİ -------------------
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """TradingView Webhook Endpoint - Tam Uyumlu"""
     try:
-        # 1. TradingView'den gelen veriyi al
-        if request.is_json:
-            data = request.get_json()
+        data = request.get_json()
+        if not data:
+            data = request.form.to_dict()
+        if not data:
+            return jsonify({"status": "error", "message": "No data"}), 400
+
+        logger.info(f"📩 Gelen sinyal: {data.get('action')} - {data.get('coin')}")
+
+        # Zorunlu alanlar
+        required = ['apiKey', 'apiSecret', 'action', 'coin', 'usdtAmount', 
+                   'leverage', 'tp1Percent', 'tp2Percent', 'stopPercent']
+        for field in required:
+            if field not in data:
+                return jsonify({"status": "error", "message": f"Eksik alan: {field}"}), 400
+
+        api_key = data['apiKey']
+        api_secret = data['apiSecret']
+        telegram_token = data.get('telegramToken', '')
+        telegram_chatid = data.get('telegramChatId', '')
+        testnet = data.get('testnet', True)
+        action = data['action']
+        coin = data['coin']
+        usdt_amount = float(data['usdtAmount'])
+        leverage = int(data['leverage'])
+        tp1_percent = float(data['tp1Percent'])
+        tp2_percent = float(data['tp2Percent'])
+        stop_percent = float(data['stopPercent'])
+        risk_percent = float(data.get('riskPercent', 2.0))  # Varsayılan %2 risk
+        
+        # Unique key for this user+coin
+        user_coin_key = (api_key, coin)
+        
+        # CCXT futures client oluştur
+        client = create_futures_client(api_key, api_secret, testnet)
+        
+        # --- ACTION: BUY (LONG) ---
+        if action == 'buy':
+            with trade_lock:
+                if user_coin_key in active_trades and not active_trades[user_coin_key].closed:
+                    msg = f"⚠️ {coin} için zaten açık işlem var, yeni buy reddedildi."
+                    send_telegram(telegram_token, telegram_chatid, msg)
+                    return jsonify({"status": "error", "message": "Active trade exists"}), 409
+            
+            # Kaldıraç ayarla
+            set_leverage(client, coin, leverage)
+            
+            # Pozisyon büyüklüğünü hesapla
+            try:
+                position_size, margin, entry_price = calculate_position_size(
+                    client, coin, usdt_amount, leverage, stop_percent, risk_percent
+                )
+            except Exception as e:
+                send_telegram(telegram_token, telegram_chatid, f"❌ Hesaplama hatası: {str(e)[:200]}")
+                return jsonify({"status": "error", "message": str(e)}), 500
+            
+            # LONG pozisyon aç
+            try:
+                order = place_futures_order(client, coin, 'buy', position_size, 'LONG')
+                trade_id = order.get('id', str(time.time()))
+            except Exception as e:
+                send_telegram(telegram_token, telegram_chatid, f"❌ LONG açma hatası: {str(e)[:200]}")
+                return jsonify({"status": "error", "message": str(e)}), 500
+            
+            # TP/SL fiyatlarını hesapla
+            tp1_price = entry_price * (1 + tp1_percent / 100)
+            tp2_price = entry_price * (1 + tp2_percent / 100)
+            stop_price = entry_price * (1 - stop_percent / 100)
+            
+            # Satılacak miktarlar
+            tp1_qty = position_size * 0.5  # %50
+            tp2_qty = position_size * 0.3  # kalanın %30'u
+            
+            # Trade monitor oluştur
+            monitor = TradeMonitor(
+                client, telegram_token, telegram_chatid, trade_id, coin, 'LONG',
+                entry_price, position_size, tp1_price, tp2_price, stop_price,
+                tp1_qty, tp2_qty
+            )
+            
+            with trade_lock:
+                active_trades[user_coin_key] = monitor
+            
+            # Monitör thread'i başlat
+            monitor_thread = threading.Thread(target=monitor.monitor, daemon=True)
+            monitor_thread.start()
+            
+            send_telegram(telegram_token, telegram_chatid, f"✅ **LONG pozisyon açıldı!**\n"
+                          f"Coin: {coin}\n"
+                          f"Pozisyon: {position_size:.4f} {coin}\n"
+                          f"Marjin: {margin:.2f} USDT\n"
+                          f"Kaldıraç: {leverage}x\n"
+                          f"Giriş: {entry_price:.2f}")
+            
+            return jsonify({"status": "success", "message": f"LONG opened: {position_size} {coin}"}), 200
+            
+        # --- ACTION: TP1, TP2, STOP (bu sinyaller opsiyonel, monitor zaten yapıyor) ---
+        # Bu sinyaller güvenlik yedeği olarak tutulabilir, ancak monitor daha öncelikli
         else:
-            # Eski format için
-            raw_data = request.data.decode('utf-8')
-            data = json.loads(raw_data)
-        
-        logger.info(f"Raw TradingView Data: {json.dumps(data, indent=2)}")
-        
-        # 2. TradingView formatını parse et
-        tv_data = parse_tradingview_data(data)
-        
-        # 3. Gerekli alanları kontrol et
-        if not tv_data['api_key'] or not tv_data['secret_key']:
-            logger.error("API keys missing in request")
-            return jsonify({
-                'status': 'error',
-                'message': 'API keys are required',
-                'received_data': data,
-                'timestamp': datetime.now().isoformat()
-            }), 400
-        
-        # 4. Binance client başlat
-        exchange, error = init_binance_client(
-            tv_data['api_key'],
-            tv_data['secret_key'],
-            tv_data['testnet']
-        )
-        
-        if error:
-            return jsonify({
-                'status': 'error',
-                'message': f'Binance connection failed: {error}',
-                'hint': 'Check if you are using TESTNET API keys for testnet=False',
-                'timestamp': datetime.now().isoformat()
-            }), 400
-        
-        # 5. Sembolü hazırla
-        symbol = tv_data['symbol']
-        if not symbol.endswith('USDT'):
-            symbol = f"{symbol}USDT"
-        
-        # 6. Mevcut pozisyonu kontrol et
-        position = get_position_info(exchange, symbol)
-        logger.info(f"Current position: {position}")
-        
-        # 7. Fiyat bilgisi
-        price = tv_data['price']
-        if price <= 0:
-            # Fiyat yoksa market fiyatını al
-            ticker = exchange.fetch_ticker(symbol)
-            price = ticker['last']
-        
-        # 8. Miktarı hesapla (USDT -> Coin miktarı)
-        quantity_usdt = tv_data['quantity_usdt']
-        quantity = quantity_usdt / price if price > 0 else quantity_usdt / 100
-        
-        # Lot boyutu ayarla
-        market = exchange.market(symbol)
-        if market:
-            min_qty = market.get('limits', {}).get('amount', {}).get('min', 0.001)
-            quantity = max(quantity, min_qty)
-            # Yuvarla
-            quantity = round(quantity, 8)
-        
-        # 9. İşlemi yap
-        islem = tv_data['islem']
-        result = None
-        
-        if islem == 'BUY':
-            # Short varsa kapat
-            if position['exists'] and position['side'] == 'short':
-                close_qty = position['amount']
-                execute_order(exchange, symbol, 'BUY', close_qty, reduce_only=True)
-                logger.info(f"Closed short position: {close_qty}")
+            with trade_lock:
+                trade = active_trades.get(user_coin_key)
+            if trade:
+                if action == 'tp1':
+                    trade.execute_tp1()
+                elif action == 'tp2':
+                    trade.execute_tp2()
+                elif action == 'stop':
+                    trade.execute_stop()
+                    with trade_lock:
+                        if user_coin_key in active_trades:
+                            del active_trades[user_coin_key]
+            return jsonify({"status": "success", "message": f"{action} signal received"}), 200
             
-            # Yeni long aç
-            result = execute_order(exchange, symbol, 'BUY', quantity)
-            
-        elif islem == 'SELL':
-            # Long varsa kapat
-            if position['exists'] and position['side'] == 'long':
-                close_qty = position['amount']
-                execute_order(exchange, symbol, 'SELL', close_qty, reduce_only=True)
-                logger.info(f"Closed long position: {close_qty}")
-            
-            # Yeni short aç
-            result = execute_order(exchange, symbol, 'SELL', quantity)
-            
-        elif islem == 'TP1' and position['exists']:
-            # %50 kar al
-            close_qty = position['amount'] * 0.5
-            if position['side'] == 'long':
-                result = execute_order(exchange, symbol, 'SELL', close_qty, reduce_only=True)
-            else:
-                result = execute_order(exchange, symbol, 'BUY', close_qty, reduce_only=True)
-                
-        elif islem == 'TP2' and position['exists']:
-            # %30 kar al
-            close_qty = position['amount'] * 0.3
-            if position['side'] == 'long':
-                result = execute_order(exchange, symbol, 'SELL', close_qty, reduce_only=True)
-            else:
-                result = execute_order(exchange, symbol, 'BUY', close_qty, reduce_only=True)
-                
-        elif islem == 'STOP' and position['exists']:
-            # Tüm pozisyonu kapat
-            close_qty = position['amount']
-            if position['side'] == 'long':
-                result = execute_order(exchange, symbol, 'SELL', close_qty, reduce_only=True)
-            else:
-                result = execute_order(exchange, symbol, 'BUY', close_qty, reduce_only=True)
-                
-        elif islem == 'CLOSE_ALL' and position['exists']:
-            # Tüm pozisyonu kapat
-            close_qty = position['amount']
-            if position['side'] == 'long':
-                result = execute_order(exchange, symbol, 'SELL', close_qty, reduce_only=True)
-            else:
-                result = execute_order(exchange, symbol, 'BUY', close_qty, reduce_only=True)
-        
-        # 10. Yanıtı hazırla
-        response = {
-            'status': 'success',
-            'message': f'TradingView signal processed: {islem} {symbol}',
-            'signal': {
-                'original': data,
-                'parsed': tv_data
-            },
-            'position_before': position,
-            'order_result': 'executed' if result else 'no_action',
-            'mode': 'testnet' if tv_data['testnet'] else 'real',
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        logger.info(f"Webhook processed successfully: {response}")
-        return jsonify(response), 200
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error: {e}")
-        return jsonify({
-            'status': 'error',
-            'message': f'Invalid JSON format: {str(e)}',
-            'timestamp': datetime.now().isoformat()
-        }), 400
-        
     except Exception as e:
-        logger.error(f"Webhook error: {str(e)}\n{traceback.format_exc()}")
-        return jsonify({
-            'status': 'error',
-            'message': f'Internal server error: {str(e)}',
-            'timestamp': datetime.now().isoformat()
-        }), 500
+        logger.error(f"Webhook hatası: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route('/test-webhook', methods=['GET', 'POST'])
-def test_webhook():
-    """Test endpoint - TradingView formatında test yap"""
-    if request.method == 'GET':
-        return jsonify({
-            'message': 'Send a POST request with TradingView format',
-            'example': {
-                'ticker': 'BTCUSDT.P',
-                'price': '50000.5',
-                'side': 'BUY',
-                'quantity': '100',
-                'binanceApiKey': 'your_testnet_api_key',
-                'binanceSecretKey': 'your_testnet_secret_key',
-                'testnet': True
-            }
-        })
-    
-    # POST ise webhook'u test et
-    return webhook()
-
-@app.route('/')
-def index():
-    return jsonify({
-        'service': 'TradingView to Binance Futures Webhook',
-        'version': '1.0',
-        'endpoints': {
-            'POST /webhook': 'Main TradingView webhook endpoint',
-            'GET /test-webhook': 'Test the webhook with sample data',
-            'GET /health': 'Health check'
-        },
-        'supported_format': {
-            'ticker': 'Symbol with .P for futures (e.g., BTCUSDT.P)',
-            'price': 'Price as string or number',
-            'side': 'BUY, SELL, TP1, TP2, STOP, CLOSE_ALL',
-            'quantity': 'Amount in USDT as string or number',
-            'binanceApiKey': 'Binance API Key (testnet for demo)',
-            'binanceSecretKey': 'Binance Secret Key',
-            'testnet': 'true/false (default: true)'
-        },
-        'timestamp': datetime.now().isoformat()
-    })
-
+# ------------------- SAĞLIK KONTROLÜ -------------------
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+    with trade_lock:
+        active_count = len(active_trades)
+    return jsonify({"status": "running", "active_trades": active_count}), 200
+
+# ------------------- WORKER VE WEB AYRIŞTIRMASI -------------------
+# NOT: Bu bot Heroku'da hem web (gunicorn) hem de worker olarak çalışacak şekilde tasarlanmıştır.
+# Worker sürekli çalışarak monitor thread'lerini yönetir.
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('DEBUG', 'false').lower() == 'true'
-    
-    logger.info("=" * 60)
-    logger.info("TRADINGVIEW TO BINANCE FUTURES WEBHOOK")
-    logger.info(f"Port: {port}")
-    logger.info("Ready to receive TradingView alerts!")
-    logger.info("=" * 60)
-    
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    # Eğer doğrudan çalıştırılırsa (development) Flask sunucusunu başlat
+    # Production'da gunicorn kullanılacak
+    port = int(os.environ.get('PORT', 5001))
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
