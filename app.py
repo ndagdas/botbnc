@@ -76,10 +76,17 @@ def webhook():
                 exchange.create_market_buy_order(symbol, abs(position_amt), {"reduceOnly": True})
 
             if position_amt <= 0:
-                qty = usdt / price
-                exchange.create_market_buy_order(symbol, qty)
-                print("BUY OK")
+                market = exchange.market(symbol)
 
+                raw_qty = usdt / price
+                min_qty = market['limits']['amount']['min']
+                precision = market['precision']['amount']
+
+                qty = max(raw_qty, min_qty)
+                qty = round(qty, precision)
+
+                exchange.create_market_buy_order(symbol, qty)
+                print(f"BUY OK | qty={qty}")
         # ---------------------------------
         # SELL (SHORT)
         # ---------------------------------
@@ -88,10 +95,17 @@ def webhook():
                 exchange.create_market_sell_order(symbol, position_amt, {"reduceOnly": True})
 
             if position_amt >= 0:
-                qty = usdt / price
-                exchange.create_market_sell_order(symbol, qty)
-                print("SELL OK")
+                market = exchange.market(symbol)
 
+                raw_qty = usdt / price
+                min_qty = market['limits']['amount']['min']
+                precision = market['precision']['amount']
+
+                qty = max(raw_qty, min_qty)
+                qty = round(qty, precision)
+
+                exchange.create_market_sell_order(symbol, qty)
+                print(f"SELL OK | qty={qty}")
         # ---------------------------------
         # TP1
         # ---------------------------------
