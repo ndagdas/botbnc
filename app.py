@@ -1,492 +1,489 @@
-"""
-TradingView → Binance Futures Webhook
-Özellikler:
-  - Exchange cache (API key başına 1 bağlantı)
-  - Hızlı 200 yanıtı + arka plan işlem (timeout yok)
-  - Telegram bildirimleri (ENTRY / TP1 / TP2 / STOP)
-  - Duplicate alert koruması
-  - Webhook secret doğrulaması
-  - Doğru lot boyutu (amount_to_precision)
-"""
+#!/usr/bin/env python3
+# ============================================================
+#  BIST_BOT.PY  —  AlgoLab / BIST Spot Trading Bot
+#  Platform   : Heroku
+#  Credentials: TradingView webhook + Telegram SMS doğrulama
+# ============================================================
 
-import os
-import json
 import logging
-import hashlib
-import threading
+import math
+import os
 import time
-from datetime import datetime
-from flask import Flask, request, jsonify
-import ccxt
 import requests
-import traceback
+import hashlib
+import json
+import base64
+from threading import Thread, Lock
+from flask import Flask, request, jsonify
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
 
-# ─── LOGGING ──────────────────────────────────────────────────
+# ── Logging ─────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-app = Flask(__name__)
+PORT = int(os.environ.get("PORT", 5000))
 
-# ─── EXCHANGE CACHE ───────────────────────────────────────────
-# API key hash → ccxt exchange nesnesi
-# Aynı kullanıcı her alert'te yeniden bağlanmak yerine
-# önbelleklenmiş nesneyi kullanır → ~1-2 saniye tasarruf
-_exchange_cache: dict = {}
-_cache_lock = threading.Lock()
+# ── Algolab Sabitler ─────────────────────────────────────────
+API_HOSTNAME  = "www.algolab.com.tr"
+API_URL       = f"https://{API_HOSTNAME}/api"
+PING_INTERVAL = 60   # saniye (oturum canlı tutma)
 
-# ─── DUPLICATE KORUMASI ───────────────────────────────────────
-# (ticker, side) çifti → son işlem zamanı (unix timestamp)
-# Aynı sinyal 10 saniye içinde tekrar gelirse engellenir
-_recent_signals: dict = {}
-_signal_lock = threading.Lock()
-DUPLICATE_WINDOW_SEC = 10
+# ── TP Oranları ──────────────────────────────────────────────
+TP1_RATIO = 0.25
+TP2_RATIO = round(30 / 75, 6)   # 0.40
+TP3_RATIO = round(25 / 45, 6)   # 0.5556
 
+# ── Oturum Durumu ────────────────────────────────────────────
+session = {
+    "api_key"    : "",
+    "hash"       : "",
+    "tg_token"   : "",
+    "tg_chat"    : "",
+    "logged_in"  : False,
+    "temp_token" : "",   # SMS doğrulama için geçici token
+}
+session_lock = Lock()
 
-# ══════════════════════════════════════════════════════════════
-# YARDIMCI FONKSİYONLAR
-# ══════════════════════════════════════════════════════════════
+# ── Telegram ────────────────────────────────────────────────
+def tg(token: str, chat: str, msg: str):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": msg, "parse_mode": "HTML"},
+            timeout=10
+        )
+    except Exception as e:
+        log.error(f"Telegram: {e}")
 
-def _key_hash(api_key: str) -> str:
-    """API key'in SHA-256 özeti — cache anahtarı olarak kullanılır."""
-    return hashlib.sha256(api_key.encode()).hexdigest()[:16]
+def tg_s(msg: str):
+    """Session'daki token/chat ile gönder."""
+    if session["tg_token"] and session["tg_chat"]:
+        tg(session["tg_token"], session["tg_chat"], msg)
 
+# ── AES Şifreleme ────────────────────────────────────────────
+def encrypt(text: str, api_key: str) -> str:
+    """AlgoLab AES-256-CBC şifreleme."""
+    try:
+        key_code = api_key.replace("API-", "")
+        key      = hashlib.sha256(key_code.encode()).digest()
+        iv       = key[:16]
+        cipher   = AES.new(key, AES.MODE_CBC, iv)
+        padded   = pad(text.encode("utf-8"), AES.block_size)
+        ct_bytes = cipher.encrypt(padded)
+        return base64.b64encode(ct_bytes).decode("utf-8")
+    except Exception as e:
+        log.error(f"Şifreleme hatası: {e}")
+        return ""
 
-def get_or_create_exchange(api_key: str, secret_key: str, testnet: bool) -> ccxt.binance:
-    """
-    Exchange nesnesini önbellekten alır ya da yeni oluşturur.
-    markets() ilk oluşturmada bir kere yüklenir, sonra atlanır.
-    """
-    key_id = _key_hash(api_key)
+def make_checker(endpoint: str, payload: dict, api_key: str) -> str:
+    """AlgoLab Checker header'ı oluştur."""
+    body    = json.dumps(payload, separators=(",", ":"))
+    raw     = f"{api_key}{endpoint}{body}"
+    checker = hashlib.sha256(raw.encode()).hexdigest()
+    return checker
 
-    with _cache_lock:
-        if key_id in _exchange_cache:
-            logger.info(f"Exchange cache hit: {key_id}")
-            return _exchange_cache[key_id]
+# ── AlgoLab API İstekleri ────────────────────────────────────
+def algolab_post(endpoint: str, payload: dict, login: bool = False) -> dict:
+    """AlgoLab REST API POST."""
+    url = f"{API_URL}{endpoint}"
+    if login:
+        headers = {"APIKEY": session["api_key"]}
+    else:
+        checker = make_checker(endpoint, payload, session["api_key"])
+        headers = {
+            "APIKEY"       : session["api_key"],
+            "Checker"      : checker,
+            "Authorization": session["hash"],
+        }
+    resp = requests.post(url, json=payload, headers=headers, timeout=15)
+    return resp.json()
 
-    # Cache'de yok — yeni oluştur
-    config = {
-        "apiKey": api_key.strip(),
-        "secret": secret_key.strip(),
-        "options": {
-            "defaultType": "future",
-            "adjustForTimeDifference": True,
-        },
-        "enableRateLimit": True,
+def algolab_get(endpoint: str, params: dict = None) -> dict:
+    url     = f"{API_URL}{endpoint}"
+    checker = make_checker(endpoint, params or {}, session["api_key"])
+    headers = {
+        "APIKEY"       : session["api_key"],
+        "Checker"      : checker,
+        "Authorization": session["hash"],
     }
+    resp = requests.get(url, params=params, headers=headers, timeout=15)
+    return resp.json()
 
-    exchange = ccxt.binance(config)
-
-    if testnet:
-        exchange.set_sandbox_mode(True)
-        logger.info("Testnet modu aktif")
-
-    # Markets yükle (sadece ilk seferinde ~1-2sn sürer)
-    exchange.load_markets()
-    exchange.fetch_time()  # Bağlantı testi
-
-    with _cache_lock:
-        _exchange_cache[key_id] = exchange
-
-    logger.info(f"Yeni exchange oluşturuldu ve cache'lendi: {key_id}")
-    return exchange
-
-
-def is_duplicate(ticker: str, side: str) -> bool:
-    """Son DUPLICATE_WINDOW_SEC saniye içinde aynı sinyal geldiyse True."""
-    sig_key = f"{ticker}:{side}"
-    now = time.time()
-
-    with _signal_lock:
-        last = _recent_signals.get(sig_key, 0)
-        if now - last < DUPLICATE_WINDOW_SEC:
+# ── Oturum Yönetimi ──────────────────────────────────────────
+def login_step1(api_key: str, username: str, password: str) -> bool:
+    """
+    Login adım 1: SMS gönder, geçici token al.
+    username = TC Kimlik No
+    password = Denizbank hesap şifresi
+    """
+    session["api_key"] = api_key if api_key.startswith("API-") else f"API-{api_key}"
+    enc_user = encrypt(username, session["api_key"])
+    enc_pass = encrypt(password, session["api_key"])
+    payload  = {"username": enc_user, "password": enc_pass}
+    try:
+        result = algolab_post("/LoginUser", payload, login=True)
+        if result.get("Success"):
+            session["temp_token"] = result["Content"]["token"]
+            log.info("Login adım 1 başarılı — SMS gönderildi")
             return True
-        _recent_signals[sig_key] = now
+        else:
+            log.error(f"Login adım 1 başarısız: {result.get('Message')}")
+            return False
+    except Exception as e:
+        log.error(f"Login adım 1 hatası: {e}")
         return False
 
+def login_step2(sms_code: str) -> bool:
+    """Login adım 2: SMS kodunu doğrula, hash al."""
+    enc_token = encrypt(session["temp_token"], session["api_key"])
+    enc_sms   = encrypt(sms_code, session["api_key"])
+    payload   = {"token": enc_token, "Password": enc_sms}
+    try:
+        result = algolab_post("/LoginUserControl", payload, login=True)
+        if result.get("Success"):
+            session["hash"]      = result["Content"]["Hash"]
+            session["logged_in"] = True
+            session["temp_token"] = ""
+            log.info("Login tamamlandı ✅")
+            return True
+        else:
+            log.error(f"SMS doğrulama başarısız: {result.get('Message')}")
+            return False
+    except Exception as e:
+        log.error(f"Login adım 2 hatası: {e}")
+        return False
 
-def parse_bool(val) -> bool:
-    """'true', True, '1', 'yes' → True; diğerleri → False."""
-    if isinstance(val, bool):
-        return val
-    return str(val).lower() in ("true", "1", "yes")
+def ping_loop():
+    """Oturumu canlı tut."""
+    while True:
+        time.sleep(PING_INTERVAL)
+        if session["logged_in"]:
+            try:
+                algolab_post("/Ping", {})
+                log.info("Ping OK")
+            except Exception as e:
+                log.warning(f"Ping başarısız: {e}")
+                session["logged_in"] = False
+                tg_s("⚠️ <b>Algolab oturumu kapandı!</b>\nYeniden login gerekli.")
 
+# ── Portföy / Pozisyon ───────────────────────────────────────
+def get_position(symbol: str) -> dict:
+    """Portföydeki hisse miktarını al."""
+    try:
+        result = algolab_get("/GetEquityInfo", {"symbol": symbol})
+        if result.get("Success") and result.get("Content"):
+            for item in result["Content"]:
+                if item.get("symbol") == symbol or item.get("Symbol") == symbol:
+                    qty = float(item.get("qty", item.get("Qty", 0)))
+                    cost = float(item.get("avgCost", item.get("AvgCost", 0)))
+                    return {"qty": qty, "avg_cost": cost}
+    except Exception as e:
+        log.error(f"Pozisyon alınamadı [{symbol}]: {e}")
+    return {"qty": 0, "avg_cost": 0}
 
-# ══════════════════════════════════════════════════════════════
-# TELEGRAM
-# ══════════════════════════════════════════════════════════════
+def get_last_price(symbol: str) -> float:
+    """Anlık fiyat al."""
+    try:
+        result = algolab_get("/GetEquities", {"symbol": symbol, "period": "1d"})
+        if result.get("Success") and result.get("Content"):
+            return float(result["Content"][0].get("c", 0))
+    except Exception as e:
+        log.error(f"Fiyat alınamadı [{symbol}]: {e}")
+    return 0.0
 
-def send_telegram(bot_token: str, chat_id: str, text: str) -> None:
-    """
-    Telegram mesajı gönderir. Hata olursa sadece loglar, fırlatmaz.
-    HTML parse modu aktif — <b>, <i>, <code> kullanılabilir.
-    """
-    if not bot_token or not chat_id:
-        logger.warning("Telegram credentials eksik — mesaj gönderilmedi.")
-        return
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+# ── Emir Fonksiyonları ───────────────────────────────────────
+def market_buy(symbol: str, tl_amount: float) -> dict:
+    """Piyasa emriyle hisse al."""
+    price = get_last_price(symbol)
+    if not price:
+        raise ValueError(f"Fiyat alınamadı: {symbol}")
+    lot = math.floor(tl_amount / price)
+    if lot <= 0:
+        raise ValueError(f"Lot sıfır: {symbol} fiyat={price} miktar={tl_amount}")
     payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+        "symbol"    : symbol,
+        "direction" : "Buy",
+        "pricetype" : "piyasa",
+        "lot"       : str(lot),
+        "price"     : "0",
+        "sms"       : "false",
+        "email"     : "false",
+        "subAccount": ""
     }
+    result = algolab_post("/SendOrder", payload)
+    if not result.get("Success"):
+        raise Exception(f"Emir hatası: {result.get('Message')}")
+    log.info(f"BUY: {symbol} {lot} lot @ ~{price} TL")
+    return {"lot": lot, "price": price, "total": round(lot * price, 2)}
+
+def market_sell(symbol: str, lot: int) -> dict:
+    """Piyasa emriyle hisse sat."""
+    if lot <= 0:
+        return {"lot": 0}
+    payload = {
+        "symbol"    : symbol,
+        "direction" : "Sell",
+        "pricetype" : "piyasa",
+        "lot"       : str(lot),
+        "price"     : "0",
+        "sms"       : "false",
+        "email"     : "false",
+        "subAccount": ""
+    }
+    result = algolab_post("/SendOrder", payload)
+    if not result.get("Success"):
+        raise Exception(f"Satış emir hatası: {result.get('Message')}")
+    log.info(f"SELL: {symbol} {lot} lot")
+    return {"lot": lot}
+
+def sell_ratio(symbol: str, ratio: float) -> int:
+    """Pozisyonun belirli oranını sat."""
+    pos = get_position(symbol)
+    if not pos["qty"]:
+        log.info(f"Satış atlandı: {symbol} pozisyon yok")
+        return 0
+    lot = math.floor(pos["qty"] * ratio)
+    if lot <= 0:
+        return 0
+    market_sell(symbol, lot)
+    return lot
+
+# ── İşlem Handler'ları ───────────────────────────────────────
+def open_long(symbol: str, tl_amount: float,
+              tp1: float, tp2: float, tp3: float, stop: float,
+              tg_token: str, tg_chat: str):
     try:
-        resp = requests.post(url, json=payload, timeout=5)
-        if not resp.ok:
-            logger.error(f"Telegram hata: {resp.status_code} {resp.text}")
-        else:
-            logger.info(f"Telegram mesajı gönderildi → {chat_id}")
+        result = market_buy(symbol, tl_amount)
+        pos    = get_position(symbol)
+        tg(tg_token, tg_chat,
+           f"🟢 <b>{symbol} ALINDI</b>\n"
+           f"━━━━━━━━━━━━━━━━━\n"
+           f"💰 Miktar : <b>{tl_amount} TL</b>\n"
+           f"📦 Lot    : <b>{result['lot']}</b>\n"
+           f"💵 Fiyat  : <b>{result['price']} TL</b>\n"
+           f"━━━━━━━━━━━━━━━━━\n"
+           f"🎯 TP1    : <b>{tp1}</b>  → %25\n"
+           f"🎯 TP2    : <b>{tp2}</b>  → %30\n"
+           f"🎯 TP3    : <b>{tp3}</b>  → %25\n"
+           f"🛑 Stop   : <b>{stop}</b>\n"
+           f"🏦 BIST / Algolab"
+        )
     except Exception as e:
-        logger.error(f"Telegram bağlantı hatası: {e}")
+        log.error(f"open_long [{symbol}]: {e}")
+        tg(tg_token, tg_chat, f"❌ <b>{symbol} alım hatası</b>\n🔍 {e}")
 
-
-def tg_entry(bot_token, chat_id, ticker, interval, price, sl, tp1, tp2, qty, side="LONG"):
-    text = (
-        f"🚀 <b>YENİ POZİSYON AÇILDI</b>\n"
-        f"━━━━━━━━━━━━━━━━━\n"
-        f"🪙 <b>Sembol:</b> <code>{ticker}</code>  |  {interval}m\n"
-        f"📈 <b>Yön:</b> {side}\n"
-        f"💵 <b>Giriş:</b> <code>{price}</code>\n"
-        f"🎯 <b>TP1:</b> <code>{tp1}</code>\n"
-        f"🎯 <b>TP2:</b> <code>{tp2}</code>\n"
-        f"🛑 <b>Stop:</b> <code>{sl}</code>\n"
-        f"📦 <b>Miktar:</b> <code>{qty} $</code>\n"
-        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
-    )
-    send_telegram(bot_token, chat_id, text)
-
-
-def tg_tp(bot_token, chat_id, ticker, tp_num, price, entry_price):
-    pct = ((float(price) - float(entry_price)) / float(entry_price) * 100) if entry_price else 0
-    text = (
-        f"✅ <b>TP{tp_num} ULAŞILDI</b>\n"
-        f"━━━━━━━━━━━━━━━━━\n"
-        f"🪙 <code>{ticker}</code>\n"
-        f"💵 <b>Fiyat:</b> <code>{price}</code>\n"
-        f"📊 <b>Kâr:</b> +{pct:.2f}%\n"
-        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
-    )
-    send_telegram(bot_token, chat_id, text)
-
-
-def tg_stop(bot_token, chat_id, ticker, exit_price, entry_price, exit_type="STOP"):
-    pct = ((float(exit_price) - float(entry_price)) / float(entry_price) * 100) if entry_price else 0
-    icon = "🛑" if pct < 0 else "🔒"
-    label = "STOP LOSS" if exit_type == "STOP" else "TRAILING EXIT"
-    text = (
-        f"{icon} <b>{label}</b>\n"
-        f"━━━━━━━━━━━━━━━━━\n"
-        f"🪙 <code>{ticker}</code>\n"
-        f"💵 <b>Çıkış:</b> <code>{exit_price}</code>\n"
-        f"📊 <b>Sonuç:</b> {pct:+.2f}%\n"
-        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
-    )
-    send_telegram(bot_token, chat_id, text)
-
-
-# ══════════════════════════════════════════════════════════════
-# EMIR FONKSİYONLARI
-# ══════════════════════════════════════════════════════════════
-
-def get_position(exchange: ccxt.binance, symbol: str) -> dict:
-    """Mevcut açık pozisyonu döner."""
+def handle_tp1(symbol: str, tg_token: str, tg_chat: str):
     try:
-        positions = exchange.fetch_positions([symbol])
-        for pos in positions:
-            amt = float(pos.get("contracts", 0) or 0)
-            if amt != 0:
-                return {
-                    "exists": True,
-                    "amount": abs(amt),
-                    "side": "long" if amt > 0 else "short",
-                    "entry_price": float(pos.get("entryPrice", 0) or 0),
-                }
+        sold = sell_ratio(symbol, TP1_RATIO)
+        pos  = get_position(symbol)
+        tg(tg_token, tg_chat,
+           f"🎯 <b>{symbol} TP1 HİT</b>\n"
+           f"━━━━━━━━━━━━━━━━━\n"
+           f"✅ <b>{sold} lot (%25)</b> satıldı\n"
+           f"📦 Kalan: <b>{pos['qty']} lot</b>"
+        )
     except Exception as e:
-        logger.error(f"Pozisyon sorgulama hatası: {e}")
-    return {"exists": False, "amount": 0, "side": None, "entry_price": 0}
+        log.error(f"TP1 [{symbol}]: {e}")
+        tg(tg_token, tg_chat, f"❌ <b>{symbol} TP1 hatası</b>\n{e}")
 
-
-def place_order(exchange: ccxt.binance, symbol: str, side: str, qty: float, reduce_only: bool = False):
-    """Market emir gönderir. Hata olursa loglar ve None döner."""
+def handle_tp2(symbol: str, tg_token: str, tg_chat: str):
     try:
-        params = {"reduceOnly": True} if reduce_only else {}
-        if side.upper() in ("BUY", "LONG"):
-            order = exchange.create_market_buy_order(symbol, qty, params)
-        else:
-            order = exchange.create_market_sell_order(symbol, qty, params)
-        logger.info(f"Emir: {side} {qty} {symbol} | reduceOnly={reduce_only}")
-        return order
+        sold = sell_ratio(symbol, TP2_RATIO)
+        pos  = get_position(symbol)
+        tg(tg_token, tg_chat,
+           f"🎯 <b>{symbol} TP2 HİT</b>\n"
+           f"━━━━━━━━━━━━━━━━━\n"
+           f"✅ <b>{sold} lot (%30)</b> satıldı\n"
+           f"📦 Kalan: <b>{pos['qty']} lot</b>"
+        )
     except Exception as e:
-        logger.error(f"Emir hatası: {e}")
-        return None
+        log.error(f"TP2 [{symbol}]: {e}")
+        tg(tg_token, tg_chat, f"❌ <b>{symbol} TP2 hatası</b>\n{e}")
 
+def handle_tp3(symbol: str, tg_token: str, tg_chat: str):
+    try:
+        sold = sell_ratio(symbol, TP3_RATIO)
+        pos  = get_position(symbol)
+        tg(tg_token, tg_chat,
+           f"🎯 <b>{symbol} TP3 HİT</b>\n"
+           f"━━━━━━━━━━━━━━━━━\n"
+           f"✅ <b>{sold} lot (%25)</b> satıldı\n"
+           f"📦 Kalan: <b>{pos['qty']} lot (trail)</b>"
+        )
+    except Exception as e:
+        log.error(f"TP3 [{symbol}]: {e}")
+        tg(tg_token, tg_chat, f"❌ <b>{symbol} TP3 hatası</b>\n{e}")
 
-def calc_qty(exchange: ccxt.binance, symbol: str, usdt_amount: float, price: float) -> float:
+def handle_stop(symbol: str, tg_token: str, tg_chat: str):
+    try:
+        pos  = get_position(symbol)
+        lot  = int(pos["qty"])
+        if lot > 0:
+            market_sell(symbol, lot)
+        tg(tg_token, tg_chat,
+           f"🛑 <b>{symbol} STOP HİT</b>\n"
+           f"━━━━━━━━━━━━━━━━━\n"
+           f"❌ <b>{lot} lot</b> satıldı, pozisyon kapatıldı"
+        )
+    except Exception as e:
+        log.error(f"STOP [{symbol}]: {e}")
+        tg(tg_token, tg_chat, f"❌ <b>{symbol} STOP hatası</b>\n{e}")
+
+# ── Yardımcılar ─────────────────────────────────────────────
+def sval(data: dict, *keys, default="") -> str:
+    for k in keys:
+        v = data.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return str(default)
+
+def fval(data: dict, *keys, default=0.0) -> float:
+    for k in keys:
+        v = data.get(k)
+        if v is not None and v != "":
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                pass
+    return float(default)
+
+# ── Flask ────────────────────────────────────────────────────
+app = Flask(__name__)
+
+@app.route("/init", methods=["POST"])
+def init_login():
     """
-    USDT miktarını, Binance'in stepSize kuralına uygun coin miktarına çevirir.
-    round(x, 8) yerine amount_to_precision kullanılır.
+    Bot'u başlat. Telegram ve Algolab bilgileri verilir.
+    {
+      "api_key"   : "API-XXXX",
+      "username"  : "TC Kimlik No",
+      "password"  : "Denizbank şifre",
+      "tg_token"  : "...",
+      "tg_chat_id": "..."
+    }
     """
-    raw_qty = usdt_amount / price
-    return float(exchange.amount_to_precision(symbol, raw_qty))
+    data = request.get_json(force=True)
+    api_key  = sval(data, "api_key")
+    username = sval(data, "username")
+    password = sval(data, "password")
+    tg_token = sval(data, "tg_token")
+    tg_chat  = sval(data, "tg_chat_id")
 
+    if not all([api_key, username, password, tg_token, tg_chat]):
+        return jsonify({"error": "Eksik alan"}), 400
 
-# ══════════════════════════════════════════════════════════════
-# ANA İŞLEM MANTIĞI (arka plan thread'inde çalışır)
-# ══════════════════════════════════════════════════════════════
+    with session_lock:
+        session["tg_token"] = tg_token
+        session["tg_chat"]  = tg_chat
 
-def process_signal(data: dict) -> None:
+    ok = login_step1(api_key, username, password)
+    if ok:
+        tg(tg_token, tg_chat,
+           "📱 <b>Algolab Login</b>\n"
+           "Telefonunuza SMS kodu gönderildi.\n"
+           "Kodu <code>/sms KODUNUZ</code> şeklinde Telegram'dan gönderin veya\n"
+           f"POST /sms endpoint'ine gönderin.")
+        return jsonify({"status": "sms_sent"}), 200
+    return jsonify({"error": "Login başarısız"}), 500
+
+@app.route("/sms", methods=["POST"])
+def sms_confirm():
     """
-    TradingView'den gelen JSON'u işler.
-    Webhook handler'ı bekletmemek için ayrı thread'de çağrılır.
+    SMS kodunu doğrula.
+    { "code": "123456" }
     """
-    # ── Alanları oku ──────────────────────────────────────────
-    ticker     = data.get("ticker", "").upper().replace(".P", "")
-    price_str  = data.get("price", "0")
-    side       = data.get("side", "").upper()
-    qty_usdt   = float(data.get("quantity", 100))
-    api_key    = data.get("binanceApiKey", "").strip()
-    secret_key = data.get("binanceSecretKey", "").strip()
-    tg_token   = data.get("telegramBotToken", "").strip()
-    tg_chat    = data.get("telegramChatId", "").strip()
-    testnet    = parse_bool(data.get("testnet", True))
-    interval   = data.get("interval", "?")
-    sl_price   = data.get("sl", "")
-    tp1_price  = data.get("tp1", "")
-    tp2_price  = data.get("tp2", "")
-    entry_price= data.get("entryPrice", "")
-    exit_price = data.get("exitPrice", "")
-    exit_type  = data.get("exitType", "STOP")
-    sug_qty    = data.get("suggestedQty", qty_usdt)
-
-    try:
-        price = float(price_str)
-    except ValueError:
-        price = 0.0
-
-    if not ticker or not side:
-        logger.error("ticker veya side eksik — sinyal atlandı.")
-        return
-
-    # ── Duplicate koruması ───────────────────────────────────
-    if is_duplicate(ticker, side):
-        logger.warning(f"Duplicate sinyal engellendi: {ticker} {side}")
-        return
-
-    # ── Sembol düzenle ───────────────────────────────────────
-    symbol = ticker if ticker.endswith("USDT") else f"{ticker}USDT"
-
-    # ── API key kontrolü ─────────────────────────────────────
-    if not api_key or not secret_key:
-        logger.error("API key eksik — işlem yapılamaz.")
-        send_telegram(tg_token, tg_chat,
-            f"⚠️ <b>HATA</b> — API key eksik!\nSembol: <code>{ticker}</code>")
-        return
-
-    # ── Exchange bağlantısı ──────────────────────────────────
-    try:
-        exchange = get_or_create_exchange(api_key, secret_key, testnet)
-    except Exception as e:
-        logger.error(f"Exchange bağlantı hatası: {e}")
-        send_telegram(tg_token, tg_chat,
-            f"⚠️ <b>BAĞLANTI HATASI</b>\n<code>{str(e)[:200]}</code>")
-        return
-
-    # ── Güncel fiyat (gönderilmediyse) ───────────────────────
-    if price <= 0:
-        try:
-            ticker_data = exchange.fetch_ticker(symbol)
-            price = ticker_data["last"]
-        except Exception as e:
-            logger.error(f"Fiyat alınamadı: {e}")
-            return
-
-    # ── Miktar hesapla ───────────────────────────────────────
-    try:
-        qty = calc_qty(exchange, symbol, qty_usdt, price)
-    except Exception as e:
-        logger.error(f"Miktar hesaplama hatası: {e}")
-        qty = round(qty_usdt / price, 6)
-
-    # ── Mevcut pozisyon ──────────────────────────────────────
-    pos = get_position(exchange, symbol)
-    logger.info(f"Mevcut pozisyon: {pos}")
-
-    # ══════════════════════════════════════════════════════
-    # SİNYAL TÜRÜNE GÖRE İŞLEM
-    # ══════════════════════════════════════════════════════
-
-    if side == "BUY":
-        # Açık short varsa önce kapat
-        if pos["exists"] and pos["side"] == "short":
-            close_qty = float(exchange.amount_to_precision(symbol, pos["amount"]))
-            place_order(exchange, symbol, "BUY", close_qty, reduce_only=True)
-            logger.info(f"Short kapatıldı: {close_qty} {symbol}")
-
-        # Long aç
-        result = place_order(exchange, symbol, "BUY", qty)
-        if result:
-            tg_entry(
-                tg_token, tg_chat,
-                ticker, interval, price,
-                sl=sl_price, tp1=tp1_price, tp2=tp2_price,
-                qty=qty_usdt
-            )
-
-    elif side == "SELL":
-        if pos["exists"] and pos["side"] == "long":
-            close_qty = float(exchange.amount_to_precision(symbol, pos["amount"]))
-            place_order(exchange, symbol, "SELL", close_qty, reduce_only=True)
-        place_order(exchange, symbol, "SELL", qty)
-
-    elif side == "TP1" and pos["exists"]:
-        close_qty = float(exchange.amount_to_precision(symbol, pos["amount"] * 0.5))
-        close_side = "SELL" if pos["side"] == "long" else "BUY"
-        result = place_order(exchange, symbol, close_side, close_qty, reduce_only=True)
-        if result:
-            tg_tp(tg_token, tg_chat, ticker, 1, price, entry_price or pos["entry_price"])
-
-    elif side == "TP2" and pos["exists"]:
-        close_qty = float(exchange.amount_to_precision(symbol, pos["amount"] * 0.5))
-        close_side = "SELL" if pos["side"] == "long" else "BUY"
-        result = place_order(exchange, symbol, close_side, close_qty, reduce_only=True)
-        if result:
-            tg_tp(tg_token, tg_chat, ticker, 2, price, entry_price or pos["entry_price"])
-
-    elif side == "STOP" and pos["exists"]:
-        close_qty = float(exchange.amount_to_precision(symbol, pos["amount"]))
-        close_side = "SELL" if pos["side"] == "long" else "BUY"
-        result = place_order(exchange, symbol, close_side, close_qty, reduce_only=True)
-        if result:
-            ep = exit_price or price
-            tg_stop(tg_token, tg_chat, ticker, ep,
-                    entry_price or pos["entry_price"], exit_type)
-
-    elif side in ("CLOSE_ALL", "CLOSE") and pos["exists"]:
-        close_qty = float(exchange.amount_to_precision(symbol, pos["amount"]))
-        close_side = "SELL" if pos["side"] == "long" else "BUY"
-        place_order(exchange, symbol, close_side, close_qty, reduce_only=True)
-        send_telegram(tg_token, tg_chat,
-            f"🔒 <b>POZİSYON KAPATILDI</b>\n🪙 <code>{ticker}</code>")
-
-    else:
-        logger.warning(f"Bilinmeyen side veya pozisyon yok: {side} | pos={pos}")
-
-
-# ══════════════════════════════════════════════════════════════
-# WEBHOOK ENDPOINT
-# ══════════════════════════════════════════════════════════════
-
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-
+    data = request.get_json(force=True)
+    code = sval(data, "code")
+    if not code:
+        return jsonify({"error": "code gerekli"}), 400
+    ok = login_step2(code)
+    if ok:
+        tg_s("✅ <b>Algolab oturumu açıldı!</b>\nBot hazır, webhook'lar aktif.")
+        return jsonify({"status": "logged_in"}), 200
+    return jsonify({"error": "SMS doğrulama başarısız"}), 401
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """
-    TradingView'den gelen alert'i alır.
-    1) Anında 200 döner (TradingView timeout almaz)
-    2) İşlemi arka plan thread'inde yapar
+    TradingView webhook — Binance bot ile aynı format.
+    Ek alan: symbol BIST formatında (örn: THYAO, GARAN)
+    Miktar TL olarak: usdt/quantity alanı TL miktarı
     """
-    # ── Webhook secret doğrulama ─────────────────────────────
-    # Pine Script, JSON body içinde 'webhookSecret' gönderiyor.
-    # Ek güvenlik için sunucuya X-Webhook-Token header'ı da eklenebilir.
+    if not session["logged_in"]:
+        return jsonify({"error": "Oturum açık değil. /init endpoint'i kullan."}), 401
+
     try:
-        data = request.get_json(force=True)
-    except Exception:
-        return jsonify({"status": "error", "message": "Geçersiz JSON"}), 400
+        raw_body = request.get_data(as_text=True)
+        log.info(f"RAW: {raw_body[:300]}")
 
-    if WEBHOOK_SECRET:
-        incoming_secret = (
-            data.get("webhookSecret", "")
-            or request.headers.get("X-Webhook-Token", "")
-        )
-        if incoming_secret != WEBHOOK_SECRET:
-            logger.warning("Geçersiz webhook secret — istek reddedildi.")
-            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+        data = request.get_json(force=True, silent=True)
+        if not data:
+            return jsonify({"error": "Geçersiz JSON"}), 400
 
-    logger.info(f"Webhook alındı: {data.get('ticker')} {data.get('side')}")
+        # Webhook secret kontrolü
+        expected = os.environ.get("WEBHOOK_SECRET", "")
+        if expected and sval(data, "webhookSecret") != expected:
+            return jsonify({"error": "Unauthorized"}), 401
 
-    # ── Hemen 200 döndür ─────────────────────────────────────
-    # TradingView 3 saniye içinde yanıt bekler.
-    # İşlem arka planda yapılır → timeout sorunu ortadan kalkar.
-    t = threading.Thread(target=_safe_process, args=(data,), daemon=True)
-    t.start()
+        action   = str(data.get("action", data.get("side", ""))).lower()
+        symbol   = str(data.get("symbol", data.get("ticker", ""))).upper().replace(".P", "")
+        tg_token = sval(data, "tg_token",   "telegramBotToken") or session["tg_token"]
+        tg_chat  = sval(data, "tg_chat_id", "telegramChatId")   or session["tg_chat"]
 
-    return jsonify({"status": "received", "timestamp": datetime.now().isoformat()}), 200
+        if not action or not symbol:
+            return jsonify({"error": "action ve symbol zorunlu"}), 400
 
+        log.info(f"▶ {action.upper()} | {symbol}")
 
-def _safe_process(data: dict) -> None:
-    """Hata yakalama katmanı — process_signal'ı sarmalar."""
-    try:
-        process_signal(data)
-    except Exception as e:
-        logger.error(f"İşlem hatası:\n{traceback.format_exc()}")
-        # Telegram'a hata bildir (mümkünse)
-        try:
-            send_telegram(
-                data.get("telegramBotToken", ""),
-                data.get("telegramChatId", ""),
-                f"❌ <b>SUNUCU HATASI</b>\n<code>{str(e)[:300]}</code>"
+        if action in ("buy", "long"):
+            open_long(
+                symbol,
+                tl_amount = fval(data, "usdt", "quantity"),
+                tp1       = fval(data, "tp1"),
+                tp2       = fval(data, "tp2"),
+                tp3       = fval(data, "tp3"),
+                stop      = fval(data, "stop", "sl"),
+                tg_token  = tg_token,
+                tg_chat   = tg_chat
             )
-        except Exception:
-            pass
+        elif action == "tp1":
+            handle_tp1(symbol, tg_token, tg_chat)
+        elif action == "tp2":
+            handle_tp2(symbol, tg_token, tg_chat)
+        elif action == "tp3":
+            handle_tp3(symbol, tg_token, tg_chat)
+        elif action in ("stop", "sell", "close"):
+            handle_stop(symbol, tg_token, tg_chat)
+        elif action == "trail_update":
+            pass  # sadece bilgi, işlem yok
+        else:
+            return jsonify({"error": f"Bilinmeyen action: {action}"}), 400
 
+        return jsonify({"status": "ok", "action": action, "symbol": symbol}), 200
 
-# ══════════════════════════════════════════════════════════════
-# YARDIMCI ENDPOINT'LER
-# ══════════════════════════════════════════════════════════════
+    except Exception as e:
+        log.error(f"Webhook hatası: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/status", methods=["GET"])
+def status():
+    return jsonify({
+        "logged_in" : session["logged_in"],
+        "platform"  : "heroku",
+        "api_key"   : session["api_key"][:15] + "..." if session["api_key"] else "",
+    }), 200
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "ok",
-        "cached_exchanges": len(_exchange_cache),
-        "timestamp": datetime.now().isoformat(),
-    })
-
-
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({
-        "service": "TradingView → Binance Futures Webhook",
-        "version": "2.0",
-        "endpoints": {
-            "POST /webhook": "TradingView alert endpoint",
-            "GET  /health":  "Durum kontrolü",
-        },
-        "expected_fields": {
-            "ticker":           "BTCUSDT veya BTCUSDT.P",
-            "price":            "Mevcut fiyat (string)",
-            "side":             "BUY | TP1 | TP2 | STOP | CLOSE_ALL",
-            "quantity":         "USDT miktarı",
-            "binanceApiKey":    "Binance API Key",
-            "binanceSecretKey": "Binance Secret Key",
-            "telegramBotToken": "Telegram Bot Token",
-            "telegramChatId":   "Telegram Chat/Kanal ID",
-            "webhookSecret":    "Sunucu doğrulama tokeni",
-            "testnet":          "true / false",
-            "sl":               "Stop loss fiyatı (opsiyonel)",
-            "tp1":              "TP1 fiyatı (opsiyonel)",
-            "tp2":              "TP2 fiyatı (opsiyonel)",
-        },
-    })
-
-
-# ══════════════════════════════════════════════════════════════
-# BAŞLATMA
-# ══════════════════════════════════════════════════════════════
+    return jsonify({"status": "running", "market": "BIST"}), 200
 
 if __name__ == "__main__":
-    port  = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("DEBUG", "false").lower() == "true"
-
-    logger.info("=" * 55)
-    logger.info("  TradingView → Binance Futures Webhook v2.0")
-    logger.info(f"  Port    : {port}")
-    logger.info(f"  Secret  : {'ayarlı ✓' if WEBHOOK_SECRET else 'AYARLANMADI ⚠'}")
-    logger.info("=" * 55)
-
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    # Ping thread başlat
+    Thread(target=ping_loop, daemon=True).start()
+    log.info(f"BIST Bot başlatıldı | Port: {PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
