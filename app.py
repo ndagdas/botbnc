@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================
-#  BOT_SHORT.PY  —  Binance Futures Short Bot (Hedge Mode)
+#  BOT_SHORT.PY  —  Binance Futures Short Bot  (HEDGE MODE)
 #  Platform   : Heroku
 #  TP Sistemi : 25% / 30% / 25% / 20% trail
 #  NOT        : Binance Hedge Mode açık olmalı
-#               Her iki yönde positionAmt pozitif gelir
-#               positionSide: "LONG" veya "SHORT" ile ayrılır
+#               Tüm emirlerde positionSide="SHORT" gönderilir
+#               closePosition Hedge Mode'da yasak → qty kullan
 # ============================================================
 
 import logging
@@ -26,8 +26,8 @@ log = logging.getLogger(__name__)
 PORT = int(os.environ.get("PORT", 5001))
 
 TP1_RATIO = 0.25
-TP2_RATIO = round(30 / 75, 6)
-TP3_RATIO = round(25 / 45, 6)
+TP2_RATIO = round(30 / 75, 6)   # 0.4
+TP3_RATIO = round(25 / 45, 6)   # 0.5556
 
 # ── Binance ─────────────────────────────────────────────────
 def get_client(api_key, api_secret, testnet):
@@ -75,6 +75,8 @@ def parse_action(data):
         "buy" : "stop", "long" : "stop", "close": "stop",
         "tp1" : "tp1",  "tp2"  : "tp2",  "tp3"  : "tp3",
         "trail_update": "trail_update",
+        "short_tp1": "tp1", "short_tp2": "tp2",
+        "short_tp3": "tp3", "short_stop": "stop",
     }
     if side in side_map:
         exit_map = {"tp1_exit": "tp1", "tp2_exit": "tp2",
@@ -130,10 +132,7 @@ def mark_price(client, symbol):
     return float(client.mark_price(symbol=symbol)["markPrice"])
 
 def open_short_position(client, symbol):
-    """
-    Hedge Mode'da SHORT pozisyonu bul.
-    positionAmt pozitif, positionSide == 'SHORT'
-    """
+    """Hedge Mode: positionSide == 'SHORT' olan açık pozisyonu döndür."""
     for p in client.get_position_risk(symbol=symbol):
         if p.get("positionSide") == "SHORT" and float(p["positionAmt"]) > 0:
             return p
@@ -142,10 +141,13 @@ def open_short_position(client, symbol):
 # ── STOP GÜNCELLE ────────────────────────────────────────────
 def update_stop_order(client, symbol, new_stop_price, info, testnet=False):
     if testnet:
-        log.info(f"[TESTNET] Stop güncelleme atlandı: {symbol} @ {new_stop_price}")
+        log.info(f"[TESTNET] Stop güncelleme atlandı (-4120): {symbol} @ {new_stop_price}")
         return
+
+    # Sadece SHORT'a ait STOP_MARKET emirlerini iptal et
     try:
-        for o in client.get_orders(symbol=symbol):
+        orders = client.get_orders(symbol=symbol)
+        for o in orders:
             if (o.get("status") == "NEW" and
                 o.get("type") == "STOP_MARKET" and
                 o.get("positionSide") == "SHORT"):
@@ -156,23 +158,26 @@ def update_stop_order(client, symbol, new_stop_price, info, testnet=False):
 
     pos = open_short_position(client, symbol)
     if not pos:
+        log.info(f"Stop güncelleme atlandı: {symbol} SHORT pozisyon kapalı")
         return
+
     try:
         pp  = info["prc"]
         qty = float(pos["positionAmt"])
+        # Hedge Mode'da closePosition yasak → qty ile gönder
         client.new_order(
             symbol=symbol, side="BUY", type="STOP_MARKET",
             stopPrice=round(new_stop_price, pp),
             quantity=qty,
             timeInForce="GTE_GTC",
             reduceOnly="true",
-            positionSide="SHORT"
+            positionSide="SHORT"            # ← Hedge Mode zorunlu
         )
-        log.info(f"Yeni SHORT STOP: {symbol} @ {round(new_stop_price, pp)}")
+        log.info(f"Yeni SHORT STOP: {symbol} @ {round(new_stop_price, pp)} qty={qty}")
     except Exception as e:
         log.error(f"Stop koyulamadı [{symbol}]: {e}")
 
-# ── MARKET KAPATMA ───────────────────────────────────────────
+# ── Kısmi Kapatma ────────────────────────────────────────────
 def market_close_ratio(client, symbol, ratio, info):
     """SHORT pozisyonun ratio kadarını BUY ile kapat."""
     pos = open_short_position(client, symbol)
@@ -191,9 +196,9 @@ def market_close_ratio(client, symbol, ratio, info):
             symbol=symbol, side="BUY",
             type="MARKET", quantity=qty,
             reduceOnly="true",
-            positionSide="SHORT"
+            positionSide="SHORT"            # ← Hedge Mode zorunlu
         )
-        log.info(f"SHORT kapat: {symbol} {qty} lot ({ratio*100:.0f}%)")
+        log.info(f"SHORT kısmi kapat: {symbol} {qty} lot ({ratio*100:.0f}%)")
         return qty
     except Exception as e:
         log.error(f"SHORT kapatma hatası [{symbol}]: {e}")
@@ -241,7 +246,7 @@ def open_short(client, token, chat, testnet, api_key,
         client.new_order(
             symbol=symbol, side="SELL",
             type="MARKET", quantity=qty,
-            positionSide="SHORT"
+            positionSide="SHORT"            # ← Hedge Mode zorunlu
         )
         log.info(f"SHORT açıldı: {symbol} {qty} lot x{leverage}")
 
@@ -253,9 +258,9 @@ def open_short(client, token, chat, testnet, api_key,
         qty_trail     = floor_qty(qty_after_tp2 - qty_tp3, q)
 
         if testnet:
-            log.info(f"[TESTNET] TP emirleri atlandı: {symbol}")
+            log.info(f"[TESTNET] TP emirleri atlandı, Pine sinyali ile kapatılacak: {symbol}")
         else:
-            # SHORT için TP = BUY ile kapat, fiyat aşağıda
+            # SHORT TP emirleri: BUY + fiyat aşağıda + positionSide=SHORT
             if tp1 > 0 and qty_tp1 > 0:
                 try:
                     client.new_order(
@@ -263,7 +268,7 @@ def open_short(client, token, chat, testnet, api_key,
                         type="TAKE_PROFIT_MARKET",
                         stopPrice=round(tp1, pp), quantity=qty_tp1,
                         timeInForce="GTE_GTC", reduceOnly="true",
-                        positionSide="SHORT"
+                        positionSide="SHORT"    # ← Hedge Mode zorunlu
                     )
                 except Exception as e:
                     log.error(f"TP1 emri [{symbol}]: {e}")
@@ -275,7 +280,7 @@ def open_short(client, token, chat, testnet, api_key,
                         type="TAKE_PROFIT_MARKET",
                         stopPrice=round(tp2, pp), quantity=qty_tp2,
                         timeInForce="GTE_GTC", reduceOnly="true",
-                        positionSide="SHORT"
+                        positionSide="SHORT"    # ← Hedge Mode zorunlu
                     )
                 except Exception as e:
                     log.error(f"TP2 emri [{symbol}]: {e}")
@@ -287,23 +292,30 @@ def open_short(client, token, chat, testnet, api_key,
                         type="TAKE_PROFIT_MARKET",
                         stopPrice=round(tp3, pp), quantity=qty_tp3,
                         timeInForce="GTE_GTC", reduceOnly="true",
-                        positionSide="SHORT"
+                        positionSide="SHORT"    # ← Hedge Mode zorunlu
                     )
                 except Exception as e:
                     log.error(f"TP3 emri [{symbol}]: {e}")
 
-        # STOP — SHORT için yukarı stop
+        # ── STOP (SHORT için yukarıda) ─────────────────────────
+        # closePosition Hedge Mode'da -4061 verir → qty kullan
         if stop > 0 and not testnet:
-            client.new_order(
-                symbol=symbol, side="BUY", type="STOP_MARKET",
-                stopPrice=round(stop, pp), closePosition="true",
-                timeInForce="GTE_GTC", positionSide="SHORT"
-            )
+            try:
+                client.new_order(
+                    symbol=symbol, side="BUY", type="STOP_MARKET",
+                    stopPrice=round(stop, pp),
+                    quantity=qty,
+                    timeInForce="GTE_GTC",
+                    reduceOnly="true",
+                    positionSide="SHORT"        # ← Hedge Mode zorunlu
+                )
+            except Exception as e:
+                log.error(f"İlk STOP emri [{symbol}]: {e}")
         elif stop > 0 and testnet:
             log.info(f"[TESTNET] STOP atlandı: {symbol} @ {stop}")
 
         tg(token, chat,
-           f"🔴 <b>{symbol} SHORT AÇILDI</b>\n"
+           f"🔴 <b>{symbol} SHORT AÇILDI</b> [Hedge Mode]\n"
            f"━━━━━━━━━━━━━━━━━\n"
            f"💰 Teminat : <b>{usdt} USDT</b>\n"
            f"⚡ Kaldıraç: <b>x{leverage}</b>\n"
@@ -326,7 +338,7 @@ def open_short(client, token, chat, testnet, api_key,
         log.error(f"open_short [{symbol}]: {e}")
         tg(token, chat, f"❌ <b>{symbol} SHORT açılamadı</b>\n🔍 {e}")
 
-# ── TP1/TP2/TP3/STOP ─────────────────────────────────────────
+# ── TP1 ──────────────────────────────────────────────────────
 def handle_tp1(client, token, chat, symbol, new_stop=0, testnet=False):
     pos = open_short_position(client, symbol)
     if not pos:
@@ -346,6 +358,7 @@ def handle_tp1(client, token, chat, symbol, new_stop=0, testnet=False):
        f"🔒 Stop güncellendi: <b>{new_stop}</b>"
     )
 
+# ── TP2 ──────────────────────────────────────────────────────
 def handle_tp2(client, token, chat, symbol, new_stop=0, testnet=False):
     pos = open_short_position(client, symbol)
     if not pos:
@@ -365,6 +378,7 @@ def handle_tp2(client, token, chat, symbol, new_stop=0, testnet=False):
        f"🔒 Stop güncellendi: <b>{new_stop}</b>"
     )
 
+# ── TP3 ──────────────────────────────────────────────────────
 def handle_tp3(client, token, chat, symbol, new_stop=0, testnet=False):
     pos = open_short_position(client, symbol)
     if not pos:
@@ -384,6 +398,7 @@ def handle_tp3(client, token, chat, symbol, new_stop=0, testnet=False):
        f"🔄 Trailing aktif: <b>{new_stop}</b>"
     )
 
+# ── STOP ─────────────────────────────────────────────────────
 def handle_stop(client, token, chat, symbol):
     cancelled = 0
     try:
@@ -393,7 +408,7 @@ def handle_stop(client, token, chat, symbol):
             client.new_order(
                 symbol=symbol, side="BUY", type="MARKET",
                 quantity=qty, reduceOnly="true",
-                positionSide="SHORT"
+                positionSide="SHORT"            # ← Hedge Mode zorunlu
             )
             log.info(f"SHORT STOP: {symbol} {qty} lot kapatıldı")
     except Exception as e:
@@ -411,7 +426,7 @@ def handle_stop(client, token, chat, symbol):
     tg(token, chat,
        f"🛑 <b>{symbol} SHORT STOP HİT</b>\n"
        f"━━━━━━━━━━━━━━━━━\n"
-       f"❌ Tüm pozisyon kapatıldı{extra}"
+       f"❌ Tüm SHORT pozisyon kapatıldı{extra}"
     )
 
 # ── FLASK ────────────────────────────────────────────────────
@@ -493,8 +508,8 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "running", "mode": "SHORT", "platform": "heroku"}), 200
+    return jsonify({"status": "running", "mode": "SHORT", "hedge": True, "platform": "heroku"}), 200
 
 if __name__ == "__main__":
-    log.info(f"SHORT Bot başlatıldı | Port: {PORT}")
+    log.info(f"SHORT Bot başlatıldı | Port: {PORT} | Hedge Mode: ON")
     app.run(host="0.0.0.0", port=PORT, debug=False)
