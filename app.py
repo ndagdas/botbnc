@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================
-#  BOT.PY  —  Binance Futures Long + Short Bot (HEDGE MODE)
+#  BOT.PY  —  Binance Futures Long + Short Bot
 #  Platform   : Heroku
 #  TP Sistemi : 25% / 30% / 25% / 20% trail
-#  NOT        : Binance Hedge Mode açık olmalı
-#               Long  → positionSide="LONG"
-#               Short → positionSide="SHORT"
-#               Tek webhook endpoint — yön side/action'dan okunur
+#  Mod        : Hedge Mode VE One-Way Mode otomatik algılanır
+#               Hedge  → positionSide="LONG" / "SHORT" eklenir
+#               One-Way→ positionSide gönderilmez
 # ============================================================
 
 import logging
@@ -40,6 +39,30 @@ def get_client(api_key: str, api_secret: str, testnet: bool) -> UMFutures:
             base_url="https://testnet.binancefuture.com"
         )
     return UMFutures(key=api_key, secret=api_secret)
+
+# ── Hedge Mode Algılama ──────────────────────────────────────
+# api_key bazlı cache — her hesap için bir kez sorgulanır
+_hedge_cache: dict = {}
+
+def is_hedge_mode(client: UMFutures, api_key: str) -> bool:
+    """
+    Binance hesabının Hedge Mode'da olup olmadığını döndürür.
+    Sonuç cache'lenir (process boyunca geçerli).
+    Hedge Mode  → positionSide="LONG"/"SHORT" gerekli
+    One-Way Mode→ positionSide gönderilmemeli
+    """
+    if api_key in _hedge_cache:
+        return _hedge_cache[api_key]
+    try:
+        result = client.get_position_mode()
+        hedge  = result.get("dualSidePosition", False)
+        _hedge_cache[api_key] = hedge
+        log.info(f"Pozisyon modu: {'HEDGE' if hedge else 'ONE-WAY'} (api_key: ...{api_key[-6:]})")
+        return hedge
+    except Exception as e:
+        log.warning(f"Pozisyon modu sorgulanamadı, ONE-WAY varsayıldı: {e}")
+        _hedge_cache[api_key] = False
+        return False
 
 # ── Telegram ────────────────────────────────────────────────
 def tg(token: str, chat: str, msg: str):
@@ -188,6 +211,29 @@ def floor_qty(val: float, precision: int) -> float:
 def mark_price(client: UMFutures, symbol: str) -> float:
     return float(client.mark_price(symbol=symbol)["markPrice"])
 
+# ── Kaldıraç Bracket Limiti ──────────────────────────────────
+def get_max_notional(client: UMFutures, symbol: str, leverage: int) -> float:
+    """
+    Verilen kaldıraç için o sembolde Binance'in izin verdiği
+    maksimum notional değerini döndürür.
+    Bulunamazsa float('inf') döner (sınırsız kabul et).
+    -2027 hatasını önlemek için open_position'da kullanılır.
+    """
+    try:
+        brackets = client.leverage_brackets(symbol=symbol)
+        if isinstance(brackets, dict):
+            brackets = [brackets]
+        for item in brackets:
+            for b in item.get("brackets", []):
+                if b.get("initialLeverage", 0) >= leverage:
+                    cap = float(b.get("notionalCap", 0))
+                    if cap > 0:
+                        log.info(f"Bracket limiti: {symbol} x{leverage} → max {cap} USDT notional")
+                        return cap
+    except Exception as e:
+        log.warning(f"Bracket sorgulanamadı [{symbol}]: {e}")
+    return float("inf")
+
 # ── Pozisyon Sorgula ────────────────────────────────────────
 def get_position(client: UMFutures, symbol: str, direction: str):
     """
@@ -230,30 +276,33 @@ def safe_qty(val: float, info: dict) -> float:
 
 # ── Kısmi Kapatma ───────────────────────────────────────────
 def market_close_ratio(client: UMFutures, symbol: str,
-                       ratio: float, info: dict, direction: str) -> float:
+                       ratio: float, info: dict,
+                       direction: str, hedge: bool) -> float:
     """
     Açık pozisyonun ratio kadarını kapatır.
     LONG  → SELL market
     SHORT → BUY  market
+    hedge=True → positionSide eklenir, False → eklenmez
     """
     pos = get_position(client, symbol, direction)
     if not pos:
         log.info(f"Kapatma atlandı: {symbol} {direction} pozisyon yok")
         return 0.0
 
-    total = abs(float(pos["positionAmt"]))   # SHORT testnet'te negatif gelebilir
+    total = abs(float(pos["positionAmt"]))
     qty   = safe_qty(total * ratio, info)
     if qty <= 0:
         log.warning(f"Kapatma qty küçük: {symbol} qty={qty}")
         return 0.0
 
     close_side = "SELL" if direction == "LONG" else "BUY"
+    params = dict(symbol=symbol, side=close_side, type="MARKET", quantity=qty)
+    if hedge:
+        params["positionSide"] = direction
+    else:
+        params["reduceOnly"]   = "true"
     try:
-        client.new_order(
-            symbol=symbol, side=close_side,
-            type="MARKET", quantity=qty,
-            positionSide=direction   # reduceOnly: Hedge Mode'da positionSide yeterli
-        )
+        client.new_order(**params)
         log.info(f"{direction} kısmi kapat: {symbol} {qty} lot ({ratio*100:.0f}%)")
         return qty
     except Exception as e:
@@ -263,17 +312,19 @@ def market_close_ratio(client: UMFutures, symbol: str,
 # ── Stop Güncelle ────────────────────────────────────────────
 def update_stop_order(client: UMFutures, symbol: str,
                       new_stop: float, info: dict,
-                      direction: str, testnet: bool = False):
+                      direction: str, testnet: bool = False,
+                      hedge: bool = True):
     if testnet:
         log.info(f"[TESTNET] Stop güncelleme atlandı: {symbol} @ {new_stop}")
         return
 
-    # Mevcut STOP_MARKET emirlerini iptal et (sadece aynı yön)
+    # Mevcut STOP_MARKET emirlerini iptal et
     try:
         for o in client.get_orders(symbol=symbol):
-            if (o.get("status") == "NEW" and
-                o.get("type") == "STOP_MARKET" and
-                o.get("positionSide") == direction):
+            if o.get("status") == "NEW" and o.get("type") == "STOP_MARKET":
+                # Hedge: positionSide eşleşmesine bak; One-Way: hepsini iptal et
+                if hedge and o.get("positionSide") != direction:
+                    continue
                 client.cancel_order(symbol=symbol, orderId=o["orderId"])
                 log.info(f"Eski {direction} STOP iptal: {o['orderId']}")
     except Exception as e:
@@ -285,16 +336,20 @@ def update_stop_order(client: UMFutures, symbol: str,
 
     try:
         pp         = info["prc"]
-        qty        = abs(float(pos["positionAmt"]))   # SHORT testnet'te negatif
+        qty        = abs(float(pos["positionAmt"]))
         close_side = "SELL" if direction == "LONG" else "BUY"
 
-        client.new_order(
+        params = dict(
             symbol=symbol, side=close_side, type="STOP_MARKET",
             stopPrice=round(new_stop, pp),
-            quantity=qty,
-            timeInForce="GTE_GTC",
-            positionSide=direction   # reduceOnly: Hedge Mode'da positionSide yeterli
+            quantity=qty, timeInForce="GTE_GTC"
         )
+        if hedge:
+            params["positionSide"] = direction
+        else:
+            params["reduceOnly"] = "true"
+
+        client.new_order(**params)
         log.info(f"Yeni {direction} STOP: {symbol} @ {round(new_stop, pp)}")
     except Exception as e:
         log.error(f"Stop koyulamadı [{symbol} {direction}]: {e}")
@@ -304,12 +359,15 @@ def update_stop_order(client: UMFutures, symbol: str,
 # ════════════════════════════════════════════════════════════
 def open_position(client, token, chat, testnet, api_key,
                   symbol, usdt, leverage, tp1, tp2, tp3, stop,
-                  direction: str):
+                  direction: str, hedge: bool):
     """
     direction = "LONG"  → BUY market + SELL TP/STOP emirleri
     direction = "SHORT" → SELL market + BUY TP/STOP emirleri
+    hedge     = True    → positionSide eklenir (Hedge Mode)
+              = False   → reduceOnly kullanılır (One-Way Mode)
     """
     emoji = "🟢" if direction == "LONG" else "🔴"
+    mode_label = "Hedge Mode" if hedge else "One-Way Mode"
     try:
         if get_position(client, symbol, direction):
             tg(token, chat,
@@ -324,7 +382,22 @@ def open_position(client, token, chat, testnet, api_key,
         info     = get_symbol_info(client, symbol, api_key)
         price    = mark_price(client, symbol)
         notional = usdt * leverage
-        qty      = floor_qty(notional / price, info["qty"])
+
+        # ── Bracket limiti kontrolü (-2027 önlemi) ────────────
+        max_notional = get_max_notional(client, symbol, leverage)
+        if notional > max_notional:
+            old_notional = notional
+            notional     = max_notional
+            log.warning(
+                f"{symbol} bracket limiti aşıldı: "
+                f"{old_notional} → {notional} USDT (x{leverage} max)"
+            )
+            tg(token, chat,
+               f"⚠️ <b>{symbol}</b> bracket limiti\n"
+               f"x{leverage} kaldıraçta max <b>{notional:.0f} USDT</b> notional\n"
+               f"Miktar otomatik düşürüldü.")
+
+        qty = floor_qty(notional / price, info["qty"])
 
         log.info(f"{direction} | {symbol} | "
                  f"{usdt}×{leverage}={notional} USDT | fiyat={price} | lot={qty}")
@@ -342,11 +415,11 @@ def open_position(client, token, chat, testnet, api_key,
         close_side  = "SELL" if direction == "LONG" else "BUY"
 
         # ── Market emri ───────────────────────────────────────
-        client.new_order(
-            symbol=symbol, side=entry_side,
-            type="MARKET", quantity=qty,
-            positionSide=direction
-        )
+        entry_params = dict(symbol=symbol, side=entry_side,
+                            type="MARKET", quantity=qty)
+        if hedge:
+            entry_params["positionSide"] = direction
+        client.new_order(**entry_params)
         log.info(f"{direction} açıldı: {symbol} {qty} lot x{leverage}")
 
         # ── Lot hesapları ─────────────────────────────────────
@@ -370,33 +443,38 @@ def open_position(client, token, chat, testnet, api_key,
             ]:
                 if tp_price > 0 and tp_qty > 0:
                     try:
-                        client.new_order(
+                        tp_params = dict(
                             symbol=symbol, side=close_side,
                             type="TAKE_PROFIT_MARKET",
                             stopPrice=round(tp_price, pp),
-                            quantity=tp_qty,
-                            timeInForce="GTE_GTC",
-                            positionSide=direction   # reduceOnly: Hedge Mode'da positionSide yeterli
+                            quantity=tp_qty, timeInForce="GTE_GTC"
                         )
+                        if hedge:
+                            tp_params["positionSide"] = direction
+                        else:
+                            tp_params["reduceOnly"] = "true"
+                        client.new_order(**tp_params)
                     except Exception as e:
                         log.error(f"{tp_name} emri [{symbol} {direction}]: {e}")
 
             # ── İlk Stop emri ─────────────────────────────────
-            # closePosition Hedge Mode'da yasak → quantity kullan
             if stop > 0:
                 try:
-                    client.new_order(
+                    stop_params = dict(
                         symbol=symbol, side=close_side, type="STOP_MARKET",
                         stopPrice=round(stop, pp),
-                        quantity=qty,
-                        timeInForce="GTE_GTC",
-                        positionSide=direction   # reduceOnly: Hedge Mode'da positionSide yeterli
+                        quantity=qty, timeInForce="GTE_GTC"
                     )
+                    if hedge:
+                        stop_params["positionSide"] = direction
+                    else:
+                        stop_params["reduceOnly"] = "true"
+                    client.new_order(**stop_params)
                 except Exception as e:
                     log.error(f"İlk STOP emri [{symbol} {direction}]: {e}")
 
         tg(token, chat,
-           f"{emoji} <b>{symbol} {direction} AÇILDI</b> [Hedge Mode]\n"
+           f"{emoji} <b>{symbol} {direction} AÇILDI</b> [{mode_label}]\n"
            f"━━━━━━━━━━━━━━━━━\n"
            f"💰 Teminat : <b>{usdt} USDT</b>\n"
            f"⚡ Kaldıraç: <b>x{leverage}</b>\n"
@@ -426,7 +504,7 @@ def open_position(client, token, chat, testnet, api_key,
 # ════════════════════════════════════════════════════════════
 def handle_tp(client, token, chat, symbol, tp_num: int,
               new_stop: float, direction: str, testnet: bool,
-              ratio: float, pct_label: str):
+              ratio: float, pct_label: str, hedge: bool):
     pos = get_position(client, symbol, direction)
     if not pos:
         tg(token, chat,
@@ -434,15 +512,14 @@ def handle_tp(client, token, chat, symbol, tp_num: int,
         return
 
     info = get_symbol_info(client, symbol)
-    sold = market_close_ratio(client, symbol, ratio, info, direction)
+    sold = market_close_ratio(client, symbol, ratio, info, direction, hedge)
 
     if new_stop > 0:
-        update_stop_order(client, symbol, new_stop, info, direction, testnet)
+        update_stop_order(client, symbol, new_stop, info, direction, testnet, hedge)
 
     pos_after = get_position(client, symbol, direction)
-    rem = float(pos_after["positionAmt"]) if pos_after else 0
+    rem = abs(float(pos_after["positionAmt"])) if pos_after else 0
 
-    emoji = "🟢" if direction == "LONG" else "🔴"
     tg(token, chat,
        f"🎯 <b>{symbol} {direction} TP{tp_num} HİT</b>\n"
        f"━━━━━━━━━━━━━━━━━\n"
@@ -454,28 +531,32 @@ def handle_tp(client, token, chat, symbol, tp_num: int,
 # ════════════════════════════════════════════════════════════
 #  STOP / TRAIL EXIT
 # ════════════════════════════════════════════════════════════
-def handle_stop(client, token, chat, symbol, direction: str):
+def handle_stop(client, token, chat, symbol, direction: str, hedge: bool):
     cancelled = 0
     close_side = "SELL" if direction == "LONG" else "BUY"
 
     try:
         pos = get_position(client, symbol, direction)
         if pos:
-            qty = abs(float(pos["positionAmt"]))   # SHORT testnet'te negatif
-            client.new_order(
-                symbol=symbol, side=close_side,
-                type="MARKET", quantity=qty,
-                positionSide=direction   # reduceOnly: Hedge Mode'da positionSide yeterli
-            )
+            qty = abs(float(pos["positionAmt"]))
+            stop_params = dict(symbol=symbol, side=close_side,
+                               type="MARKET", quantity=qty)
+            if hedge:
+                stop_params["positionSide"] = direction
+            else:
+                stop_params["reduceOnly"] = "true"
+            client.new_order(**stop_params)
             log.info(f"{direction} STOP: {symbol} {qty} lot kapatıldı")
     except Exception as e:
         log.warning(f"{direction} kapama [{symbol}]: {e}")
 
     try:
         for o in client.get_orders(symbol=symbol):
-            if (o.get("status") == "NEW" and
-                o.get("type") in ("TAKE_PROFIT_MARKET", "STOP_MARKET") and
-                o.get("positionSide") == direction):
+            if o.get("status") == "NEW" and \
+               o.get("type") in ("TAKE_PROFIT_MARKET", "STOP_MARKET"):
+                # Hedge: sadece aynı yönü iptal et; One-Way: hepsini iptal et
+                if hedge and o.get("positionSide") != direction:
+                    continue
                 client.cancel_order(symbol=symbol, orderId=o["orderId"])
                 cancelled += 1
     except Exception as e:
@@ -536,6 +617,9 @@ def webhook():
         log.info(f"▶ {direction} {action.upper()} | {symbol} | testnet={testnet}")
         client = get_client(api_key, api_secret, testnet)
 
+        # ── Hedge Mode algıla ─────────────────────────────────
+        hedge = is_hedge_mode(client, api_key)
+
         # ── Routing ───────────────────────────────────────────
         if action == "open":
             open_position(
@@ -546,7 +630,8 @@ def webhook():
                 tp2       = fval(data, "tp2"),
                 tp3       = fval(data, "tp3"),
                 stop      = fval(data, "stop", "sl", "exitPrice", "stopPrice"),
-                direction = direction
+                direction = direction,
+                hedge     = hedge
             )
 
         elif action == "tp1":
@@ -556,7 +641,8 @@ def webhook():
                       direction = direction,
                       testnet   = testnet,
                       ratio     = TP1_RATIO,
-                      pct_label = "%25")
+                      pct_label = "%25",
+                      hedge     = hedge)
 
         elif action == "tp2":
             handle_tp(client, tg_token, tg_chat, symbol,
@@ -565,7 +651,8 @@ def webhook():
                       direction = direction,
                       testnet   = testnet,
                       ratio     = TP2_RATIO,
-                      pct_label = "%30")
+                      pct_label = "%30",
+                      hedge     = hedge)
 
         elif action == "tp3":
             handle_tp(client, tg_token, tg_chat, symbol,
@@ -574,10 +661,11 @@ def webhook():
                       direction = direction,
                       testnet   = testnet,
                       ratio     = TP3_RATIO,
-                      pct_label = "%25")
+                      pct_label = "%25",
+                      hedge     = hedge)
 
         elif action == "stop":
-            handle_stop(client, tg_token, tg_chat, symbol, direction)
+            handle_stop(client, tg_token, tg_chat, symbol, direction, hedge)
 
         elif action == "trail":
             log.info(f"Trail bilgi: {symbol} {direction} @ {fval(data, 'new_stop')}")
