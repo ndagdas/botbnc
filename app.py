@@ -359,12 +359,20 @@ def update_stop_order(client: UMFutures, symbol: str,
 # ════════════════════════════════════════════════════════════
 def open_position(client, token, chat, testnet, api_key,
                   symbol, usdt, leverage, tp1, tp2, tp3, stop,
-                  direction: str, hedge: bool):
+                  direction: str, hedge: bool, suggested_qty: float = 0.0):
     """
     direction = "LONG"  → BUY market + SELL TP/STOP emirleri
     direction = "SHORT" → SELL market + BUY TP/STOP emirleri
     hedge     = True    → positionSide eklenir (Hedge Mode)
               = False   → reduceOnly kullanılır (One-Way Mode)
+
+    Pozisyon büyüklüğü belirleme — 2 yöntem:
+      1) suggested_qty > 0  → ATR/Yüzde bazlı risk hesaplı miktar (Pine Script
+         tarafında "riskAmt / stopDistance" formülüyle hesaplanır). Bu durumda
+         qty DOĞRUDAN bu değerden gelir; usdt/leverage sadece bracket-limit
+         kontrolü ve loglama için notional hesabında kullanılır.
+      2) suggested_qty <= 0 → eski davranış: qty = (usdt × leverage) / fiyat
+         (statik teminat bazlı, geriye dönük uyumluluk için korunur)
     """
     emoji = "🟢" if direction == "LONG" else "🔴"
     mode_label = "Hedge Mode" if hedge else "One-Way Mode"
@@ -381,13 +389,26 @@ def open_position(client, token, chat, testnet, api_key,
 
         info     = get_symbol_info(client, symbol, api_key)
         price    = mark_price(client, symbol)
-        notional = usdt * leverage
+
+        sizing_method = "sabit_usdt"
+        if suggested_qty and suggested_qty > 0:
+            # ── ATR/Yüzde risk-bazlı boyutlandırma ────────────
+            qty           = floor_qty(suggested_qty, info["qty"])
+            notional      = qty * price
+            sizing_method = "atr_risk_bazli"
+            log.info(f"Risk-bazlı boyutlandırma kullanıldı: "
+                     f"{symbol} suggestedQty={suggested_qty} → qty={qty}")
+        else:
+            # ── Eski davranış: statik teminat × kaldıraç ──────
+            notional = usdt * leverage
+            qty      = floor_qty(notional / price, info["qty"])
 
         # ── Bracket limiti kontrolü (-2027 önlemi) ────────────
         max_notional = get_max_notional(client, symbol, leverage)
         if notional > max_notional:
             old_notional = notional
             notional     = max_notional
+            qty          = floor_qty(notional / price, info["qty"])
             log.warning(
                 f"{symbol} bracket limiti aşıldı: "
                 f"{old_notional} → {notional} USDT (x{leverage} max)"
@@ -397,10 +418,8 @@ def open_position(client, token, chat, testnet, api_key,
                f"x{leverage} kaldıraçta max <b>{notional:.0f} USDT</b> notional\n"
                f"Miktar otomatik düşürüldü.")
 
-        qty = floor_qty(notional / price, info["qty"])
-
-        log.info(f"{direction} | {symbol} | "
-                 f"{usdt}×{leverage}={notional} USDT | fiyat={price} | lot={qty}")
+        log.info(f"{direction} | {symbol} | sizing={sizing_method} | "
+                 f"notional={round(notional,2)} USDT | fiyat={price} | lot={qty}")
 
         if qty <= 0:
             raise ValueError(f"Lot sıfır — fiyat:{price} notional:{notional}")
@@ -473,10 +492,13 @@ def open_position(client, token, chat, testnet, api_key,
                 except Exception as e:
                     log.error(f"İlk STOP emri [{symbol} {direction}]: {e}")
 
+        sizing_note = ("📐 ATR/Risk bazlı" if sizing_method == "atr_risk_bazli"
+                       else "💰 Sabit teminat")
+
         tg(token, chat,
            f"{emoji} <b>{symbol} {direction} AÇILDI</b> [{mode_label}]\n"
            f"━━━━━━━━━━━━━━━━━\n"
-           f"💰 Teminat : <b>{usdt} USDT</b>\n"
+           f"{sizing_note}\n"
            f"⚡ Kaldıraç: <b>x{leverage}</b>\n"
            f"📊 Notional: <b>{round(notional, 2)} USDT</b>\n"
            f"📦 Toplam  : <b>{qty} lot</b>\n"
@@ -624,14 +646,15 @@ def webhook():
         if action == "open":
             open_position(
                 client, tg_token, tg_chat, testnet, api_key, symbol,
-                usdt      = fval(data, "usdt", "quantity"),
-                leverage  = int(fval(data, "leverage", default=1)),
-                tp1       = fval(data, "tp1"),
-                tp2       = fval(data, "tp2"),
-                tp3       = fval(data, "tp3"),
-                stop      = fval(data, "stop", "sl", "exitPrice", "stopPrice"),
-                direction = direction,
-                hedge     = hedge
+                usdt          = fval(data, "usdt", "quantity"),
+                leverage      = int(fval(data, "leverage", default=1)),
+                tp1           = fval(data, "tp1"),
+                tp2           = fval(data, "tp2"),
+                tp3           = fval(data, "tp3"),
+                stop          = fval(data, "stop", "sl", "exitPrice", "stopPrice"),
+                direction     = direction,
+                hedge         = hedge,
+                suggested_qty = fval(data, "suggestedQty", default=0.0)
             )
 
         elif action == "tp1":
