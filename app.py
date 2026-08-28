@@ -27,9 +27,9 @@ log = logging.getLogger(__name__)
 PORT = int(os.environ.get("PORT", 5000))
 
 # ── Lot Dağılımı ─────────────────────────────────────────────
-TP1_RATIO = 0.25
-TP2_RATIO = round(30 / 75, 6)   # 0.4000
-TP3_RATIO = round(25 / 45, 6)   # 0.5556
+TP1_RATIO = 0.50
+TP2_RATIO = round(25/50, 6) # 0.5
+TP3_RATIO = round(15/25, 6) # 0.6
 
 # ── Binance ─────────────────────────────────────────────────
 def get_client(api_key: str, api_secret: str, testnet: bool) -> UMFutures:
