@@ -8,6 +8,15 @@
 #               One-Way→ positionSide gönderilmez
 #  Telegram   : Mesajlarda lot yerine USDT tutarı, kapanışta
 #               K/Z (USDT) ve güncel kasa bakiyesi gösterilir
+#
+#  DEĞİŞİKLİK (09.09.2026): Sembol doğrulaması artık HERHANGİ
+#  bir canlı Binance API çağrısından ÖNCE yapılıyor. Önceki
+#  sürümde get_position() (positionRisk endpoint'i) sembolü
+#  doğrulanmadan önce çağrılıyordu, bu da geçersiz semboller
+#  için -1121 hatasının Binance'ten canlı olarak dönmesine
+#  sebep oluyordu. Artık cache'lenmiş exchangeInfo'ya karşı
+#  önceden kontrol ediliyor; geçersizse hiçbir API çağrısı
+#  yapılmadan sinyal atlanıyor.
 # ============================================================
 
 import logging
@@ -160,12 +169,30 @@ def get_exchange_info(client: UMFutures, api_key: str,
     return data
 
 def _parse_symbol_info(s: dict) -> dict:
-    max_qty = min_qty = None
+    """
+    ÖNEMLİ: Bu bot SADECE market-tipi emirler kullanıyor (MARKET,
+    STOP_MARKET, TAKE_PROFIT_MARKET). Binance'te bunlar LOT_SIZE
+    filtresine değil, ayrı ve genelde çok daha düşük bir maxQty
+    taşıyan MARKET_LOT_SIZE filtresine tabidir. Sadece LOT_SIZE'a
+    bakmak, gerçekte izin verilenden büyük miktarların hesaplanıp
+    Binance tarafından -4005 ile reddedilmesine yol açar. İkisi de
+    varsa daha kısıtlayıcı (min max / max min) olanı kullanıyoruz.
+    """
+    lot_max = lot_min = None
+    mkt_max = mkt_min = None
     for f in s.get("filters", []):
         if f["filterType"] == "LOT_SIZE":
-            max_qty = float(f["maxQty"])
-            min_qty = float(f["minQty"])
-            break
+            lot_max = float(f["maxQty"])
+            lot_min = float(f["minQty"])
+        elif f["filterType"] == "MARKET_LOT_SIZE":
+            mkt_max = float(f["maxQty"])
+            mkt_min = float(f["minQty"])
+
+    candidates_max = [v for v in (lot_max, mkt_max) if v is not None]
+    candidates_min = [v for v in (lot_min, mkt_min) if v is not None]
+    max_qty = min(candidates_max) if candidates_max else None
+    min_qty = max(candidates_min) if candidates_min else None
+
     return {
         "qty"    : s["quantityPrecision"],
         "prc"    : s["pricePrecision"],
@@ -184,6 +211,52 @@ def get_symbol_info(client: UMFutures, symbol: str, api_key: str = "") -> dict:
             return _parse_symbol_info(s)
     raise ValueError(f"Sembol bulunamadı: {symbol}")
 
+# ── YENİ: Canlı API çağrısından önce sembolü doğrula ─────────
+def is_valid_symbol(client: UMFutures, symbol: str, api_key: str = "") -> bool:
+    """
+    Sembolü SADECE cache'lenmiş exchangeInfo'ya karşı kontrol eder.
+    Binance'e symbol parametreli canlı bir istek ATMAZ, dolayısıyla
+    geçersiz sembollerde -1121 hatasının API'den dönmesini önler.
+    """
+    try:
+        get_symbol_info(client, symbol, api_key)
+        return True
+    except ValueError:
+        return False
+    except Exception as e:
+        log.warning(f"Sembol doğrulama beklenmeyen hata [{symbol}]: {e}")
+        return False
+
+def find_symbol_suggestions(client: UMFutures, symbol: str, api_key: str = "", limit: int = 5) -> list:
+    """
+    Sembol tam eşleşmezse, çekirdek coin adını (baştaki '1000' gibi
+    çarpan öneklerini ve 'USDT'yi çıkararak) içeren diğer Futures
+    sembollerini arar. Binance çoğu zaman çok düşük fiyatlı coinleri
+    '1000XUSDT' gibi çarpanlı isimlerle listeler.
+
+    ÖNEMLİ: Bu sadece TEŞHİS içindir — bulunan öneriler otomatik
+    olarak İŞLEME SOKULMAZ. Çarpanlı bir kontratta fiyat/miktar
+    ölçeği normal coinden 1000x (veya farklı) olabilir; Pine
+    tarafındaki TP/SL seviyeleri ham coin fiyatına göre hesaplandığı
+    için kör bir sembol değişimi miktar/fiyat hesaplarını tamamen
+    yanlış yapıp gerçek parayla yanlış büyüklükte pozisyon açılmasına
+    yol açabilir. Bu yüzden bulgu sadece Telegram'a bildirilir; asıl
+    düzeltme TradingView alert şablonundaki sembol kaynağını
+    (hangi borsa/format) kontrol etmek olmalı.
+    """
+    import re
+    try:
+        info = get_exchange_info(client, api_key)
+        base = symbol.replace("USDT", "").replace("BUSD", "")
+        base_core = re.sub(r'^[0-9]+', '', base)
+        if not base_core:
+            return []
+        return [s["symbol"] for s in info["symbols"]
+                if base_core in s["symbol"] and s["symbol"] != symbol][:limit]
+    except Exception as e:
+        log.warning(f"Sembol önerisi aranamadı [{symbol}]: {e}")
+        return []
+
 def floor_qty(val: float, precision: int) -> float:
     f = 10 ** precision
     return math.floor(val * f) / f
@@ -193,20 +266,62 @@ def mark_price(client: UMFutures, symbol: str) -> float:
 
 # ── Kaldıraç Bracket Limiti ──────────────────────────────────
 def get_max_notional(client: UMFutures, symbol: str, leverage: int) -> float:
+    """
+    Verilen kaldıraçta izin verilen MAKSİMUM notional'ı döndürür.
+    ÖNEMLİ: Binance'in bracket listesi düşük notional/yüksek kaldıraçtan
+    yüksek notional/düşük kaldıraca doğru sıralıdır. Kaldıracı destekleyen
+    ilk (en küçük) bracket'i değil, kaldıracı destekleyen TÜM bracket'ler
+    arasından en büyük cap'i almak gerekir — aksi halde gereksiz yere çok
+    düşük bir limit uygulanır (veya hiç eşleşme yoksa hatalı biçimde
+    sınırsız/"inf" dönüp limit tamamen devre dışı kalır).
+    """
     try:
         brackets = client.leverage_brackets(symbol=symbol)
         if isinstance(brackets, dict):
             brackets = [brackets]
+        best_cap = 0.0
         for item in brackets:
             for b in item.get("brackets", []):
                 if b.get("initialLeverage", 0) >= leverage:
                     cap = float(b.get("notionalCap", 0))
-                    if cap > 0:
-                        log.info(f"Bracket limiti: {symbol} x{leverage} → max {cap} USDT notional")
-                        return cap
+                    if cap > best_cap:
+                        best_cap = cap
+        if best_cap > 0:
+            # Market emri fiyatı, mark_price'ı çektiğimiz an ile emrin
+            # gerçekleşme anı arasında kayabilir (özellikle 10sn scalp +
+            # düşük likiditeli altcoinlerde). Cap'in tam sınırında kalmak
+            # yerine küçük bir güvenlik payı bırakıyoruz (%3), aksi halde
+            # kırpılmış miktar bile sınırı marjinal aşıp -2027 üretebiliyor.
+            safe_cap = best_cap * 0.97
+            log.info(f"Bracket limiti: {symbol} x{leverage} → ham {best_cap} / "
+                     f"güvenlik payıyla {safe_cap:.2f} USDT notional")
+            return safe_cap
+        # Hiçbir bracket bu kaldıracı desteklemiyor — sembolün izin verdiği
+        # tavandan daha yüksek bir kaldıraç istenmiş demektir. Sınırsız
+        # (inf) DÖNMÜYORUZ; bunun yerine 0 dönüp çağıran tarafın en düşük
+        # bracket'in cap'ine (en güvenli değer) düşmesini sağlıyoruz.
+        log.warning(f"{symbol}: x{leverage} kaldıracını destekleyen bracket bulunamadı")
+        return 0.0
     except Exception as e:
         log.warning(f"Bracket sorgulanamadı [{symbol}]: {e}")
-    return float("inf")
+        return float("inf")
+
+def get_max_leverage(client: UMFutures, symbol: str) -> int:
+    """Sembolün Binance Futures'ta izin verdiği maksimum kaldıracı döndürür."""
+    try:
+        brackets = client.leverage_brackets(symbol=symbol)
+        if isinstance(brackets, dict):
+            brackets = [brackets]
+        max_lev = 0
+        for item in brackets:
+            for b in item.get("brackets", []):
+                lev = int(b.get("initialLeverage", 0))
+                if lev > max_lev:
+                    max_lev = lev
+        return max_lev
+    except Exception as e:
+        log.warning(f"Max kaldıraç sorgulanamadı [{symbol}]: {e}")
+        return 0
 
 # ── Pozisyon Sorgula ────────────────────────────────────────
 def get_position(client: UMFutures, symbol: str, direction: str):
@@ -323,6 +438,26 @@ def fmt_pnl(pnl: float) -> str:
     sign = "🟢+" if pnl >= 0 else "🔴"
     return f"{sign}{round(pnl, 2)} USDT"
 
+# ── Bilinen Binance hata kodları için okunur teşhis ──────────
+_ERROR_DIAGNOSES = {
+    "-1121": "Sembol Binance Futures'ta yok (spot'ta olabilir, ya da "
+             "yanlış formatlanmış).\n",
+    "-2027": "Bu kaldıraçta izin verilen maksimum pozisyon büyüklüğü "
+             "aşıldı (bracket limiti). Kaldıracı düşürmeyi veya işlem "
+             "miktarını küçültmeyi düşün.\n",
+    "-4005": "Miktar, sembolün market emirleri için izin verdiği "
+             "maksimumu aşıyor (MARKET_LOT_SIZE).\n",
+    "-4164": "Notional, sembolün minimum emir büyüklüğünün altında "
+             "kaldı.\n",
+    "-2019": "Marjin yetersiz — bakiye bu pozisyonu karşılamıyor.\n",
+}
+
+def _diagnose_error(err_str: str) -> str:
+    for code, msg in _ERROR_DIAGNOSES.items():
+        if code in err_str:
+            return f"💡 {msg}"
+    return ""
+
 # ════════════════════════════════════════════════════════════
 #  LONG / SHORT AÇ
 # ════════════════════════════════════════════════════════════
@@ -332,15 +467,34 @@ def open_position(client, token, chat, testnet, api_key,
     emoji = "🟢" if direction == "LONG" else "🔴"
     mode_label = "Hedge Mode" if hedge else "One-Way Mode"
     try:
+        # Not: sembol burada zaten webhook() içinde önceden doğrulandı.
         if get_position(client, symbol, direction):
             tg(token, chat,
                f"⚠️ <b>{symbol}</b>\nAçık {direction} var, sinyal atlandı.")
             return
 
+        # ── Kaldıracı ayarla; reddedilirse SESSİZCE GEÇME — sembolün
+        # gerçekten desteklediği maksimum kaldıraca düş ve kullanıcıyı
+        # bilgilendir. Aksi halde kod, Binance'in aslında uygulamadığı
+        # yüksek bir kaldıraçla notional hesaplamaya devam eder ve
+        # bracket limiti (get_max_notional) de aynı yanlış kaldıraçla
+        # sorgulandığı için hiçbir üst sınır uygulanmamış olur — tam
+        # olarak -2027 hatasına yol açan zincir budur.
+        effective_leverage = leverage
         try:
             client.change_leverage(symbol=symbol, leverage=leverage)
-        except ClientError:
-            pass
+        except ClientError as e:
+            max_lev = get_max_leverage(client, symbol)
+            effective_leverage = max_lev if max_lev > 0 else leverage
+            log.warning(
+                f"{symbol}: x{leverage} kaldıraç reddedildi ({e}); "
+                f"x{effective_leverage} kullanılacak"
+            )
+            tg(token, chat,
+               f"⚠️ <b>{symbol}</b>\n"
+               f"x{leverage} kaldıraç bu sembolde desteklenmiyor.\n"
+               f"Sembolün izin verdiği maksimum olan x{effective_leverage} "
+               f"kullanılıyor.")
 
         info     = get_symbol_info(client, symbol, api_key)
         price    = mark_price(client, symbol)
@@ -353,21 +507,21 @@ def open_position(client, token, chat, testnet, api_key,
             log.info(f"Risk-bazlı boyutlandırma kullanıldı: "
                      f"{symbol} suggestedQty={suggested_qty} → qty={qty}")
         else:
-            notional = usdt * leverage
+            notional = usdt * effective_leverage
             qty      = floor_qty(notional / price, info["qty"])
 
-        max_notional = get_max_notional(client, symbol, leverage)
+        max_notional = get_max_notional(client, symbol, effective_leverage)
         if notional > max_notional:
             old_notional = notional
             notional     = max_notional
             qty          = floor_qty(notional / price, info["qty"])
             log.warning(
                 f"{symbol} bracket limiti aşıldı: "
-                f"{old_notional} → {notional} USDT (x{leverage} max)"
+                f"{old_notional} → {notional} USDT (x{effective_leverage} max)"
             )
             tg(token, chat,
                f"⚠️ <b>{symbol}</b> bracket limiti\n"
-               f"x{leverage} kaldıraçta max <b>{notional:.0f} USDT</b> notional\n"
+               f"x{effective_leverage} kaldıraçta max <b>{notional:.0f} USDT</b> notional\n"
                f"Miktar otomatik düşürüldü.")
 
         log.info(f"{direction} | {symbol} | sizing={sizing_method} | "
@@ -385,12 +539,51 @@ def open_position(client, token, chat, testnet, api_key,
         entry_side  = "BUY"  if direction == "LONG" else "SELL"
         close_side  = "SELL" if direction == "LONG" else "BUY"
 
-        entry_params = dict(symbol=symbol, side=entry_side,
-                            type="MARKET", quantity=qty)
-        if hedge:
-            entry_params["positionSide"] = direction
-        client.new_order(**entry_params)
-        log.info(f"{direction} açıldı: {symbol} {qty} lot x{leverage}")
+        # ── Giriş emri: -2027 (bracket/leverage) veya -4005 (max qty)
+        # gibi miktar-kaynaklı Binance reddi alırsak, bunun sebebi
+        # genelde client tarafında tam öngöremediğimiz şeylerdir
+        # (mark_price ile gerçek eşleşme fiyatı arasındaki kayma,
+        # ondalık yuvarlama, ya da hesap genelindeki agregat marjin
+        # durumu). Böyle bir ret alırsak miktarı kademeli küçültüp
+        # birkaç kez tekrar deniyoruz; her ihtimalde tamamen
+        # başarısız olup sinyali kaçırmaktansa daha küçük de olsa
+        # pozisyonu açmayı tercih ediyoruz.
+        max_retries = 3
+        last_err = None
+        opened = False
+        for attempt in range(max_retries):
+            entry_params = dict(symbol=symbol, side=entry_side,
+                                type="MARKET", quantity=qty)
+            if hedge:
+                entry_params["positionSide"] = direction
+            try:
+                client.new_order(**entry_params)
+                opened = True
+                break
+            except ClientError as e:
+                err_str = str(e)
+                if "-2027" in err_str or "-4005" in err_str:
+                    last_err = e
+                    qty = floor_qty(qty * 0.75, q)
+                    log.warning(
+                        f"{symbol} giriş reddedildi ({err_str[:60]}), "
+                        f"deneme {attempt+1}/{max_retries}, yeni qty={qty}"
+                    )
+                    if info["min_qty"] and qty < info["min_qty"]:
+                        log.warning(f"{symbol}: küçültme min lot altına düştü, vazgeçiliyor")
+                        break
+                    continue
+                raise
+
+        if not opened:
+            raise ValueError(
+                f"Giriş emri {max_retries} denemede de reddedildi "
+                f"(son hata: {last_err}). Muhtemel sebep: bracket/kaldıraç "
+                f"limiti veya sembolün max emir miktarı."
+            )
+
+        notional = qty * price
+        log.info(f"{direction} açıldı: {symbol} {qty} lot x{effective_leverage}")
 
         qty_tp1       = safe_qty(qty * TP1_RATIO, info)
         qty_after_tp1 = floor_qty(qty - qty_tp1, q)
@@ -472,7 +665,9 @@ def open_position(client, token, chat, testnet, api_key,
     except Exception as e:
         log.error(f"open_position [{symbol} {direction}]: {e}")
         tg(token, chat,
-           f"❌ <b>{symbol} {direction} açılamadı</b>\n🔍 {e}")
+           f"❌ <b>{symbol} {direction} açılamadı</b>\n"
+           f"{_diagnose_error(str(e))}"
+           f"🔍 {e}")
 
 # ════════════════════════════════════════════════════════════
 #  TP1 / TP2 / TP3
@@ -605,6 +800,31 @@ def webhook():
         log.info(f"▶ {direction} {action.upper()} | {symbol} | testnet={testnet}")
         client = get_client(api_key, api_secret, testnet)
 
+        # ── YENİ: Sembolü, herhangi bir canlı API çağrısından ÖNCE doğrula ──
+        # Bu kontrol, cache'lenmiş exchangeInfo'ya bakar; Binance'e symbol
+        # parametreli bir istek ATMAZ. Böylece geçersiz semboller (yanlış
+        # yazılmış ticker, TradingView'da farklı borsadan gelen sembol,
+        # Futures'ta listelenmeyen coin vs.) hiçbir gerçek API isteğine
+        # sebep olmadan burada yakalanıp sessizce atlanır.
+        if not is_valid_symbol(client, symbol, api_key):
+            suggestions = find_symbol_suggestions(client, symbol, api_key)
+            log.warning(f"Geçersiz sembol, sinyal atlandı: {symbol} | öneriler: {suggestions}")
+            if suggestions:
+                sugg_txt = ", ".join(suggestions)
+                msg = (f"⚠️ <b>{symbol}</b>\nBinance Futures'ta bu isimle yok.\n"
+                       f"🔎 Yakın eşleşme(ler): <b>{sugg_txt}</b>\n"
+                       f"Bunlardan biri gerçek sembol olabilir (örn. çarpanlı "
+                       f"'1000X' kontrat) — ama fiyat/miktar ölçeği farklı "
+                       f"olabileceğinden otomatik geçiş YAPILMADI. TradingView "
+                       f"alert şablonundaki sembol kaynağını kontrol et.")
+            else:
+                msg = (f"⚠️ <b>{symbol}</b>\nBinance Futures'ta bu sembol bulunamadı, "
+                       f"yakın bir eşleşme de yok. Muhtemelen bu coin Futures'ta "
+                       f"hiç listeli değil (sadece spot'ta olabilir).")
+            tg(tg_token, tg_chat, msg)
+            return jsonify({"status": "skipped", "reason": "invalid_symbol",
+                            "symbol": symbol, "suggestions": suggestions}), 200
+
         hedge = is_hedge_mode(client, api_key)
 
         if action == "open":
@@ -678,7 +898,7 @@ def webhook():
     except Exception as e:
         err_str = str(e)
         if "-1121" in err_str:
-            log.warning(f"Geçersiz sembol atlandı: {err_str[:80]}")
+            log.warning(f"Geçersiz sembol atlandı (yedek yakalama): {err_str[:80]}")
             return jsonify({"status": "skipped", "reason": "invalid_symbol"}), 200
         log.error(f"Webhook hatası: {e}")
         return jsonify({"error": err_str}), 500
