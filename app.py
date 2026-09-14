@@ -198,34 +198,65 @@ def _parse_symbol_info(s: dict) -> dict:
         "prc"    : s["pricePrecision"],
         "max_qty": max_qty,
         "min_qty": min_qty,
+        "status" : s.get("status", "UNKNOWN"),
     }
 
-def get_symbol_info(client: UMFutures, symbol: str, api_key: str = "") -> dict:
+def _find_raw_symbol(client: UMFutures, symbol: str, api_key: str = "") -> dict:
+    """exchangeInfo'daki HAM sembol kaydını döndürür (status dahil), yoksa None."""
     info = get_exchange_info(client, api_key)
     for s in info["symbols"]:
         if s["symbol"] == symbol:
-            return _parse_symbol_info(s)
+            return s
     info = get_exchange_info(client, api_key, force_refresh=True)
     for s in info["symbols"]:
         if s["symbol"] == symbol:
-            return _parse_symbol_info(s)
-    raise ValueError(f"Sembol bulunamadı: {symbol}")
+            return s
+    return None
+
+def get_symbol_info(client: UMFutures, symbol: str, api_key: str = "") -> dict:
+    """
+    Sembolün var olduğunu VE durumunun TRADING olduğunu kontrol eder.
+    Binance exchangeInfo'da sembol listede olabilir ama status'u
+    CLOSE/BREAK/PENDING_TRADING olabilir (delist sürecinde, askıya
+    alınmış, henüz açılmamış vb.) — bu durumda pozisyon açma denemesi
+    -4140/-4141 gibi hatalarla reddedilir. Sadece "listede var mı"ya
+    bakmak yetersiz; status'u da TRADING olmalı.
+    """
+    raw = _find_raw_symbol(client, symbol, api_key)
+    if raw is None:
+        raise ValueError(f"Sembol bulunamadı: {symbol}")
+    parsed = _parse_symbol_info(raw)
+    if parsed["status"] != "TRADING":
+        raise RuntimeError(
+            f"Sembol '{symbol}' Binance Futures'ta kayıtlı ama şu an "
+            f"işlem için kapalı (status: {parsed['status']})"
+        )
+    return parsed
 
 # ── YENİ: Canlı API çağrısından önce sembolü doğrula ─────────
-def is_valid_symbol(client: UMFutures, symbol: str, api_key: str = "") -> bool:
+def check_symbol_tradable(client: UMFutures, symbol: str, api_key: str = "") -> tuple:
     """
-    Sembolü SADECE cache'lenmiş exchangeInfo'ya karşı kontrol eder.
-    Binance'e symbol parametreli canlı bir istek ATMAZ, dolayısıyla
-    geçersiz sembollerde -1121 hatasının API'den dönmesini önler.
+    Döndürür: (ok: bool, reason: str, detail: str)
+    reason ∈ {"ok", "not_found", "not_trading", "error"}
+    Sadece cache'lenmiş exchangeInfo'ya bakar, symbol parametreli
+    canlı bir Binance isteği ATMAZ.
     """
     try:
-        get_symbol_info(client, symbol, api_key)
-        return True
-    except ValueError:
-        return False
+        raw = _find_raw_symbol(client, symbol, api_key)
+        if raw is None:
+            return False, "not_found", ""
+        status = raw.get("status", "UNKNOWN")
+        if status != "TRADING":
+            return False, "not_trading", status
+        return True, "ok", status
     except Exception as e:
         log.warning(f"Sembol doğrulama beklenmeyen hata [{symbol}]: {e}")
-        return False
+        return False, "error", str(e)
+
+def is_valid_symbol(client: UMFutures, symbol: str, api_key: str = "") -> bool:
+    """Geriye dönük uyumluluk için basit bool sarmalayıcı."""
+    ok, _, _ = check_symbol_tradable(client, symbol, api_key)
+    return ok
 
 def find_symbol_suggestions(client: UMFutures, symbol: str, api_key: str = "", limit: int = 5) -> list:
     """
@@ -352,17 +383,18 @@ def safe_qty(val: float, info: dict) -> float:
 # ── Kısmi Kapatma ───────────────────────────────────────────
 def market_close_ratio(client: UMFutures, symbol: str,
                        ratio: float, info: dict,
-                       direction: str, hedge: bool) -> float:
+                       direction: str, hedge: bool) -> tuple:
+    """Döner: (qty, order_id). Emir başarısız/atlanırsa order_id=None."""
     pos = get_position(client, symbol, direction)
     if not pos:
         log.info(f"Kapatma atlandı: {symbol} {direction} pozisyon yok")
-        return 0.0
+        return 0.0, None
 
     total = abs(float(pos["positionAmt"]))
     qty   = safe_qty(total * ratio, info)
     if qty <= 0:
         log.warning(f"Kapatma qty küçük: {symbol} qty={qty}")
-        return 0.0
+        return 0.0, None
 
     close_side = "SELL" if direction == "LONG" else "BUY"
     params = dict(symbol=symbol, side=close_side, type="MARKET", quantity=qty)
@@ -371,12 +403,12 @@ def market_close_ratio(client: UMFutures, symbol: str,
     else:
         params["reduceOnly"]   = "true"
     try:
-        client.new_order(**params)
+        result = client.new_order(**params)
         log.info(f"{direction} kısmi kapat: {symbol} {qty} lot ({ratio*100:.0f}%)")
-        return qty
+        return qty, result.get("orderId")
     except Exception as e:
         log.error(f"Kısmi kapatma hatası [{symbol} {direction}]: {e}")
-        return 0.0
+        return 0.0, None
 
 # ── Stop Güncelle ────────────────────────────────────────────
 def update_stop_order(client: UMFutures, symbol: str,
@@ -425,14 +457,44 @@ def update_stop_order(client: UMFutures, symbol: str,
 def calc_pnl_usdt(entry_price: float, exit_price: float,
                   qty: float, direction: str) -> float:
     """
-    USDT-marjinli futures'ta basit K/Z: (çıkış - giriş) * miktar,
-    SHORT için ters işaretli. Komisyon/fonlama dahil değildir —
-    yaklaşık, bilgilendirme amaçlı bir değerdir.
+    YEDEK/TAHMİNİ hesap — SADECE Binance'in gerçek kayıtları
+    okunamazsa (API hatası vb.) son çare olarak kullanılır.
+    Basit (çıkış - giriş) × miktar; komisyon/fonlama dahil DEĞİLDİR,
+    kısmi doluşları da yansıtmaz. Asıl kaynak get_order_realized_pnl.
     """
     if entry_price <= 0 or exit_price <= 0 or qty <= 0:
         return 0.0
     diff = (exit_price - entry_price) if direction == "LONG" else (entry_price - exit_price)
     return diff * qty
+
+def get_order_realized_pnl(client: UMFutures, symbol: str, order_id):
+    """
+    Bir emrin GERÇEK gerçekleşen K/Z'sini Binance'in kendi userTrades
+    (fill) kayıtlarından okur. Bu, Binance'in Transaction History'de
+    gösterdiği rakamla birebir eşleşir — kısmi doluşlar, birden fazla
+    fiyat seviyesinden gerçekleşme, komisyon vb. hiçbir şey client
+    tarafında yeniden hesaplanmaz/tahmin edilmez; Binance'in kendi
+    muhasebesi olduğu gibi okunur.
+    Emrin fill kayıtları henüz Binance tarafında işlenmemiş olabilir
+    diye kısa bir gecikmeyle tek retry yapılır. Bulunamazsa None döner
+    (çağıran taraf o zaman tahmini hesaba düşer).
+    """
+    if not order_id:
+        return None
+    import time as _time
+    for attempt in range(2):
+        try:
+            trades = client.get_account_trades(symbol=symbol, orderId=order_id)
+            if trades:
+                pnl = sum(float(t.get("realizedPnl", 0)) for t in trades)
+                log.info(f"Gerçek K/Z (Binance kayıtlarından) [{symbol} order={order_id}]: {pnl}")
+                return pnl
+            if attempt == 0:
+                _time.sleep(0.5)
+        except Exception as e:
+            log.warning(f"Order realized PNL okunamadı [{symbol} order={order_id}]: {e}")
+            return None
+    return None
 
 def fmt_pnl(pnl: float) -> str:
     sign = "🟢+" if pnl >= 0 else "🔴"
@@ -683,7 +745,7 @@ def handle_tp(client, token, chat, symbol, tp_num: int,
         return
 
     info = get_symbol_info(client, symbol)
-    sold = market_close_ratio(client, symbol, ratio, info, direction, hedge)
+    sold, order_id = market_close_ratio(client, symbol, ratio, info, direction, hedge)
 
     if new_stop > 0:
         update_stop_order(client, symbol, new_stop, info, direction, testnet, hedge)
@@ -692,9 +754,18 @@ def handle_tp(client, token, chat, symbol, tp_num: int,
     rem = abs(float(pos_after["positionAmt"])) if pos_after else 0
 
     # ── K/Z (bu kısmi kapatma için) + güncel kasa ──────────────
-    px_for_pnl = exit_price if exit_price > 0 else mark_price(client, symbol)
-    pnl_usdt   = calc_pnl_usdt(entry_price, px_for_pnl, sold, direction)
-    usdt_sold  = round(sold * px_for_pnl, 2)
+    # Önce Binance'in KENDİ fill kayıtlarından gerçek K/Z okunur;
+    # sadece bu okunamazsa (API hatası vb.) tahmini hesaba düşülür.
+    real_pnl = get_order_realized_pnl(client, symbol, order_id)
+    if real_pnl is not None:
+        pnl_usdt = real_pnl
+    else:
+        px_for_pnl = exit_price if exit_price > 0 else mark_price(client, symbol)
+        pnl_usdt   = calc_pnl_usdt(entry_price, px_for_pnl, sold, direction)
+        log.warning(f"{symbol} TP{tp_num}: gerçek K/Z okunamadı, tahmini değer kullanıldı")
+
+    px_for_display = exit_price if exit_price > 0 else mark_price(client, symbol)
+    usdt_sold  = round(sold * px_for_display, 2)
     balance    = get_usdt_balance(client)
 
     tg(token, chat,
@@ -714,6 +785,7 @@ def handle_stop(client, token, chat, symbol, direction: str, hedge: bool,
     cancelled = 0
     close_side = "SELL" if direction == "LONG" else "BUY"
     closed_qty = 0.0
+    close_order_id = None
 
     try:
         pos = get_position(client, symbol, direction)
@@ -725,7 +797,8 @@ def handle_stop(client, token, chat, symbol, direction: str, hedge: bool,
                 stop_params["positionSide"] = direction
             else:
                 stop_params["reduceOnly"] = "true"
-            client.new_order(**stop_params)
+            result = client.new_order(**stop_params)
+            close_order_id = result.get("orderId")
             log.info(f"{direction} STOP: {symbol} {closed_qty} lot kapatıldı")
     except Exception as e:
         log.warning(f"{direction} kapama [{symbol}]: {e}")
@@ -742,8 +815,15 @@ def handle_stop(client, token, chat, symbol, direction: str, hedge: bool,
         log.warning(f"Emir iptal [{symbol} {direction}]: {e}")
 
     # ── K/Z (kalan pozisyonun kapanışı) + güncel kasa ──────────
-    px_for_pnl = exit_price if exit_price > 0 else mark_price(client, symbol)
-    pnl_usdt   = calc_pnl_usdt(entry_price, px_for_pnl, closed_qty, direction)
+    # Önce Binance'in KENDİ fill kayıtlarından gerçek K/Z okunur;
+    # sadece bu okunamazsa tahmini hesaba düşülür.
+    real_pnl = get_order_realized_pnl(client, symbol, close_order_id)
+    if real_pnl is not None:
+        pnl_usdt = real_pnl
+    else:
+        px_for_pnl = exit_price if exit_price > 0 else mark_price(client, symbol)
+        pnl_usdt   = calc_pnl_usdt(entry_price, px_for_pnl, closed_qty, direction)
+        log.warning(f"{symbol} STOP: gerçek K/Z okunamadı, tahmini değer kullanıldı")
     balance    = get_usdt_balance(client)
 
     extra = f"\n🔧 {cancelled} emir iptal edildi" if cancelled else ""
@@ -800,30 +880,49 @@ def webhook():
         log.info(f"▶ {direction} {action.upper()} | {symbol} | testnet={testnet}")
         client = get_client(api_key, api_secret, testnet)
 
-        # ── YENİ: Sembolü, herhangi bir canlı API çağrısından ÖNCE doğrula ──
-        # Bu kontrol, cache'lenmiş exchangeInfo'ya bakar; Binance'e symbol
-        # parametreli bir istek ATMAZ. Böylece geçersiz semboller (yanlış
-        # yazılmış ticker, TradingView'da farklı borsadan gelen sembol,
-        # Futures'ta listelenmeyen coin vs.) hiçbir gerçek API isteğine
-        # sebep olmadan burada yakalanıp sessizce atlanır.
-        if not is_valid_symbol(client, symbol, api_key):
-            suggestions = find_symbol_suggestions(client, symbol, api_key)
-            log.warning(f"Geçersiz sembol, sinyal atlandı: {symbol} | öneriler: {suggestions}")
-            if suggestions:
-                sugg_txt = ", ".join(suggestions)
-                msg = (f"⚠️ <b>{symbol}</b>\nBinance Futures'ta bu isimle yok.\n"
-                       f"🔎 Yakın eşleşme(ler): <b>{sugg_txt}</b>\n"
-                       f"Bunlardan biri gerçek sembol olabilir (örn. çarpanlı "
-                       f"'1000X' kontrat) — ama fiyat/miktar ölçeği farklı "
-                       f"olabileceğinden otomatik geçiş YAPILMADI. TradingView "
-                       f"alert şablonundaki sembol kaynağını kontrol et.")
+        # ── Sembolü, herhangi bir canlı emir çağrısından ÖNCE doğrula ──
+        # Sadece "isim listede var mı" değil, sembolün status'unun da
+        # TRADING olduğunu kontrol ediyoruz (bkz. check_symbol_tradable).
+        # MAVIAUSDT vakası: sembol exchangeInfo'da vardı ama status'u
+        # TRADING değildi (kapalı/delist sürecinde) — bu kontrol
+        # olmadan her API çağrısı ayrı ayrı -4140/-4141/-4028 ile patladı.
+        ok, reason, detail = check_symbol_tradable(client, symbol, api_key)
+        if not ok:
+            if reason == "not_trading":
+                log.warning(f"Sembol kapalı, sinyal atlandı: {symbol} (status={detail})")
+                msg = (f"⚠️ <b>{symbol}</b>\nBinance Futures'ta kayıtlı ama şu an "
+                       f"işlem için KAPALI (status: <b>{detail}</b>) — askıya "
+                       f"alınmış veya delist sürecinde olabilir. Sinyal atlandı, "
+                       f"bu durum bot tarafında düzeltilemez.")
+                tg(tg_token, tg_chat, msg)
+                return jsonify({"status": "skipped", "reason": "symbol_not_trading",
+                                "symbol": symbol, "binance_status": detail}), 200
+            elif reason == "not_found":
+                suggestions = find_symbol_suggestions(client, symbol, api_key)
+                log.warning(f"Geçersiz sembol, sinyal atlandı: {symbol} | öneriler: {suggestions}")
+                if suggestions:
+                    sugg_txt = ", ".join(suggestions)
+                    msg = (f"⚠️ <b>{symbol}</b>\nBinance Futures'ta bu isimle yok.\n"
+                           f"🔎 Yakın eşleşme(ler): <b>{sugg_txt}</b>\n"
+                           f"Bunlardan biri gerçek sembol olabilir (örn. çarpanlı "
+                           f"'1000X' kontrat) — ama fiyat/miktar ölçeği farklı "
+                           f"olabileceğinden otomatik geçiş YAPILMADI. TradingView "
+                           f"alert şablonundaki sembol kaynağını kontrol et.")
+                else:
+                    msg = (f"⚠️ <b>{symbol}</b>\nBinance Futures'ta bu sembol bulunamadı, "
+                           f"yakın bir eşleşme de yok. Muhtemelen bu coin Futures'ta "
+                           f"hiç listeli değil (sadece spot'ta olabilir).")
+                tg(tg_token, tg_chat, msg)
+                return jsonify({"status": "skipped", "reason": "invalid_symbol",
+                                "symbol": symbol, "suggestions": suggestions}), 200
             else:
-                msg = (f"⚠️ <b>{symbol}</b>\nBinance Futures'ta bu sembol bulunamadı, "
-                       f"yakın bir eşleşme de yok. Muhtemelen bu coin Futures'ta "
-                       f"hiç listeli değil (sadece spot'ta olabilir).")
-            tg(tg_token, tg_chat, msg)
-            return jsonify({"status": "skipped", "reason": "invalid_symbol",
-                            "symbol": symbol, "suggestions": suggestions}), 200
+                # reason == "error": exchangeInfo sorgusu başarısız oldu —
+                # sembolün gerçekten geçersiz olduğunu KANITLAYAMADIK, o
+                # yüzden sinyali atlamak yerine devam ediyoruz; asıl emir
+                # denemesi kendi hata mesajını üretecek.
+                log.warning(f"Sembol doğrulaması yapılamadı [{symbol}]: {detail}, devam ediliyor")
+
+
 
         hedge = is_hedge_mode(client, api_key)
 
