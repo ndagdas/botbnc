@@ -704,12 +704,37 @@ def open_position(client, token, chat, testnet, api_key,
         sizing_note = ("📐 ATR/Risk bazlı" if sizing_method == "atr_risk_bazli"
                        else "💰 Sabit teminat")
 
+        # ── Gerçek teminat/likidasyon bilgisi — TAHMİN DEĞİL, doğrudan
+        # Binance'in pozisyon risk verisinden okunuyor. "İşlem
+        # Büyüklüğü" kaldıraçlı TOPLAM pozisyon değeridir (notional);
+        # cepten/teminattan giden gerçek miktar bunun kaldıraca
+        # bölünmüş halidir ve likidasyon riski o rakama göre
+        # değerlendirilmelidir — bu yüzden ikisini birbirinden
+        # net ayırarak gösteriyoruz.
+        real_pos = get_position(client, symbol, direction)
+        margin_line = ""
+        liq_line = ""
+        if real_pos:
+            real_notional = abs(float(real_pos.get("notional", notional)))
+            liq_price     = float(real_pos.get("liquidationPrice", 0) or 0)
+            margin_type   = real_pos.get("marginType", "")
+            if margin_type == "isolated":
+                real_margin = abs(float(real_pos.get("isolatedMargin", 0) or 0))
+                margin_line = f"💳 Kullanılan Teminat: <b>{round(real_margin, 2)} USDT</b> (isolated, gerçek)\n"
+            else:
+                approx_margin = real_notional / effective_leverage if effective_leverage else 0
+                margin_line = f"💳 Kullanılan Teminat: <b>≈{round(approx_margin, 2)} USDT</b> (cross, yaklaşık)\n"
+            if liq_price > 0:
+                liq_line = f"⚠️ Likidasyon Fiyatı: <b>{liq_price}</b>\n"
+
         tg(token, chat,
            f"{emoji} <b>{symbol} {direction} AÇILDI</b> [{mode_label}]\n"
            f"━━━━━━━━━━━━━━━━━\n"
            f"{sizing_note}\n"
-           f"⚡ Kaldıraç: <b>x{leverage}</b>\n"
-           f"📊 İşlem Büyüklüğü: <b>{round(notional, 2)} USDT</b>\n"
+           f"⚡ Kaldıraç: <b>x{effective_leverage}</b>\n"
+           f"📊 İşlem Büyüklüğü (notional, kaldıraçlı): <b>{round(notional, 2)} USDT</b>\n"
+           f"{margin_line}"
+           f"{liq_line}"
            f"💵 Giriş   : <b>{price}</b>\n"
            f"━━━━━━━━━━━━━━━━━\n"
            f"🎯 TP1 : <b>{tp1}</b>  → ~{usdt_tp1} USDT (%25)\n"
@@ -782,27 +807,52 @@ def handle_tp(client, token, chat, symbol, tp_num: int,
 # ════════════════════════════════════════════════════════════
 def handle_stop(client, token, chat, symbol, direction: str, hedge: bool,
                 entry_price: float = 0.0, exit_price: float = 0.0):
-    cancelled = 0
     close_side = "SELL" if direction == "LONG" else "BUY"
     closed_qty = 0.0
     close_order_id = None
 
+    pos = get_position(client, symbol, direction)
+
+    if not pos:
+        # ── Pozisyon zaten kapalı: muhtemelen Binance'in kendi
+        # STOP_MARKET/TAKE_PROFIT_MARKET emri fiyata anlık dokunup
+        # pozisyonu ÇOKTAN kapatmış, ama Pine'ın bar-kapanışı bazlı
+        # kontrolü aynı koşulu bir sonraki barda da true görüp
+        # GEÇ/MÜKERRER bir "stop" sinyali daha göndermiş. Bu durumda
+        # yeni bir kapatma denemesi YAPMIYORUZ (zaten yapacak bir şey
+        # yok) ve yanıltıcı "STOP HİT, K/Z: 0" mesajı basmıyoruz —
+        # sadece geride kalmış olabilecek (artık karşılığı olmayan)
+        # TP/STOP emirlerini temizliyoruz.
+        cancelled = 0
+        try:
+            for o in client.get_orders(symbol=symbol):
+                if o.get("status") == "NEW" and \
+                   o.get("type") in ("TAKE_PROFIT_MARKET", "STOP_MARKET"):
+                    if hedge and o.get("positionSide") != direction:
+                        continue
+                    client.cancel_order(symbol=symbol, orderId=o["orderId"])
+                    cancelled += 1
+        except Exception as e:
+            log.warning(f"Geç sinyal temizliği [{symbol} {direction}]: {e}")
+        log.info(f"{symbol} {direction}: pozisyon zaten kapalıydı, "
+                 f"geç/mükerrer stop sinyali atlandı ({cancelled} bekleyen emir temizlendi)")
+        return
+
     try:
-        pos = get_position(client, symbol, direction)
-        if pos:
-            closed_qty = abs(float(pos["positionAmt"]))
-            stop_params = dict(symbol=symbol, side=close_side,
-                               type="MARKET", quantity=closed_qty)
-            if hedge:
-                stop_params["positionSide"] = direction
-            else:
-                stop_params["reduceOnly"] = "true"
-            result = client.new_order(**stop_params)
-            close_order_id = result.get("orderId")
-            log.info(f"{direction} STOP: {symbol} {closed_qty} lot kapatıldı")
+        closed_qty = abs(float(pos["positionAmt"]))
+        stop_params = dict(symbol=symbol, side=close_side,
+                           type="MARKET", quantity=closed_qty)
+        if hedge:
+            stop_params["positionSide"] = direction
+        else:
+            stop_params["reduceOnly"] = "true"
+        result = client.new_order(**stop_params)
+        close_order_id = result.get("orderId")
+        log.info(f"{direction} STOP: {symbol} {closed_qty} lot kapatıldı")
     except Exception as e:
         log.warning(f"{direction} kapama [{symbol}]: {e}")
 
+    cancelled = 0
     try:
         for o in client.get_orders(symbol=symbol):
             if o.get("status") == "NEW" and \
