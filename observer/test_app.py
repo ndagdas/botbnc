@@ -60,6 +60,11 @@ class ObserverTests(unittest.TestCase):
     def test_incomplete_and_unclosed_cannot_promote(self):
         for data in [signal(rsi=None),signal(barConfirmed=False)]:
             self.assertNotEqual(app_module.deterministic_review(app_module.normalize_signal(data))['decision'],'AL')
+    def test_old_alert_timestamp_and_unbroken_band(self):
+        data=app_module.normalize_signal(signal(signalTime=(time.time()-600)*1000))
+        self.assertEqual(app_module.deterministic_review(data)['decision'],'RED')
+        data=app_module.normalize_signal(signal(breakoutConfirmed=False))
+        self.assertEqual(app_module.deterministic_review(data)['decision'],'İZLE')
     def test_large_pump_and_low_rr_rejected(self):
         for data in [signal(entryMovePct=17),signal(riskReward=.8)]:
             self.assertEqual(app_module.deterministic_review(app_module.normalize_signal(data))['decision'],'RED')
