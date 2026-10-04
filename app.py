@@ -891,67 +891,20 @@ def handle_stop(client, token, chat, symbol, direction: str, hedge: bool,
 # ════════════════════════════════════════════════════════════
 app = Flask(__name__)
 
-# Read-only signal observer; separate URL keeps the existing /webhook execution
-# path and its Binance position management unchanged.
-from observer.app import SIGNAL_QUEUE as OBSERVER_QUEUE
-from observer.app import _is_duplicate as observer_is_duplicate
-from observer.app import normalize_signal as normalize_observer_signal
-from observer.app import start_worker as start_observer_worker
+# Observation-only routes; the existing Binance execution route is separate.
+from observer.app import webhook as receive_observer_signal
+from observer.app import health as observer_health_details
 
 
 @app.route("/observer/webhook", methods=["POST"])
 def observer_webhook():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict) or not data:
-        return jsonify(error="Geçersiz JSON"), 400
-
-    expected = os.getenv("WEBHOOK_SECRET", "")
-    supplied = str(data.get("webhookSecret", data.get("webhook_secret", "")))
-    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
-        return jsonify(error="Unauthorized"), 401
-
-    action = str(data.get("action", "")).strip().lower()
-    side = str(data.get("side", "")).strip().upper()
-    exit_actions = {
-        "tp1", "tp2", "tp3", "stop", "trail_exit", "trail_update", "close",
-        "take_profit1", "take_profit2", "take_profit3",
-    }
-    exit_sides = {"STOP", "TP1", "TP2", "TP3", "TRAIL_EXIT"}
-    if action in exit_actions or side in exit_sides:
-        return jsonify(status="ignored", reason="exit_management_event",
-                       mode="telegram_observation_only",
-                       binance_orders_enabled=False), 200
-
-    try:
-        signal_data = normalize_observer_signal(data)
-    except (ValueError, TypeError) as exc:
-        return jsonify(error=str(exc)), 400
-
-    if not os.getenv("TELEGRAM_BOT_TOKEN") or not os.getenv("TELEGRAM_CHAT_ID"):
-        return jsonify(error="Telegram ortam değişkenleri eksik"), 503
-
-    if observer_is_duplicate(signal_data):
-        return jsonify(status="duplicate", mode="telegram_observation_only"), 200
-    try:
-        OBSERVER_QUEUE.put_nowait(signal_data)
-    except Exception as exc:
-        import queue as queue_module
-        if isinstance(exc, queue_module.Full):
-            return jsonify(error="Gözlem kuyruğu dolu"), 429
-        log.exception("Gözlem kuyruğuna sinyal eklenemedi")
-        return jsonify(error="Gözlem kuyruğu kullanılamıyor"), 503
-
-    start_observer_worker()
-    return jsonify(status="accepted", mode="telegram_observation_only",
-                   binance_orders_enabled=False), 202
+    return receive_observer_signal()
 
 
 @app.route("/observer/health", methods=["GET"])
 def observer_health():
-    return jsonify(status="running", mode="telegram_observation_only",
-                   binance_orders_enabled=False,
-                   telegram_configured=bool(os.getenv("TELEGRAM_BOT_TOKEN") and
-                                            os.getenv("TELEGRAM_CHAT_ID"))), 200
+    return observer_health_details()
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -1127,3 +1080,4 @@ def health():
 if __name__ == "__main__":
     log.info(f"Long+Short Bot başlatıldı | Port: {PORT} | Hedge Mode: ON")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
