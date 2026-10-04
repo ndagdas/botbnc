@@ -126,6 +126,12 @@ def deterministic_review(data):
     missing = sorted(required - data.keys())
     if missing:
         reasons.append("Eksik veri: " + ", ".join(missing))
+    signal_time = data.get("signalTime")
+    if signal_time is not None:
+        signal_seconds = signal_time / 1000 if signal_time > 100000000000 else signal_time
+        age = time.time() - signal_seconds
+        if age > float(os.getenv("MAX_SIGNAL_AGE_SECONDS", "180")) or age < -120:
+            hard_reject.append("alarm zaman damgası eski veya gelecekte")
     if data.get("_receivedAt") and time.time() - data["_receivedAt"] > float(os.getenv("MAX_SIGNAL_AGE_SECONDS", "180")):
         hard_reject.append("giriş alarmı değerlendirmeye geç ulaştı")
     if "pumpScore" in data:
@@ -246,7 +252,7 @@ def deterministic_review(data):
         decision = "AL"
     else:
         decision = "İZLE"
-    if closed_bar is False and decision == "AL":
+    if (closed_bar is False or breakout is False) and decision == "AL":
         decision = "İZLE"
     if missing and decision == "AL":
         decision = "İZLE"
