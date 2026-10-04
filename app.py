@@ -22,6 +22,7 @@
 import logging
 import math
 import os
+import hmac
 import requests
 from flask import Flask, request, jsonify
 from binance.um_futures import UMFutures
@@ -889,6 +890,56 @@ def handle_stop(client, token, chat, symbol, direction: str, hedge: bool,
 #  FLASK
 # ════════════════════════════════════════════════════════════
 app = Flask(__name__)
+
+# Read-only signal observer; separate URL keeps the existing /webhook execution
+# path and its Binance position management unchanged.
+from observer.app import SIGNAL_QUEUE as OBSERVER_QUEUE
+from observer.app import _is_duplicate as observer_is_duplicate
+from observer.app import normalize_signal as normalize_observer_signal
+from observer.app import start_worker as start_observer_worker
+
+
+@app.route("/observer/webhook", methods=["POST"])
+def observer_webhook():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not data:
+        return jsonify(error="Geçersiz JSON"), 400
+
+    expected = os.getenv("WEBHOOK_SECRET", "")
+    supplied = str(data.get("webhookSecret", data.get("webhook_secret", "")))
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return jsonify(error="Unauthorized"), 401
+
+    if not os.getenv("TELEGRAM_BOT_TOKEN") or not os.getenv("TELEGRAM_CHAT_ID"):
+        return jsonify(error="Telegram ortam değişkenleri eksik"), 503
+
+    try:
+        signal_data = normalize_observer_signal(data)
+    except (ValueError, TypeError) as exc:
+        return jsonify(error=str(exc)), 400
+
+    if observer_is_duplicate(signal_data):
+        return jsonify(status="duplicate", mode="telegram_observation_only"), 200
+    try:
+        OBSERVER_QUEUE.put_nowait(signal_data)
+    except Exception as exc:
+        import queue as queue_module
+        if isinstance(exc, queue_module.Full):
+            return jsonify(error="Gözlem kuyruğu dolu"), 429
+        log.exception("Gözlem kuyruğuna sinyal eklenemedi")
+        return jsonify(error="Gözlem kuyruğu kullanılamıyor"), 503
+
+    start_observer_worker()
+    return jsonify(status="accepted", mode="telegram_observation_only",
+                   binance_orders_enabled=False), 202
+
+
+@app.route("/observer/health", methods=["GET"])
+def observer_health():
+    return jsonify(status="running", mode="telegram_observation_only",
+                   binance_orders_enabled=False,
+                   telegram_configured=bool(os.getenv("TELEGRAM_BOT_TOKEN") and
+                                            os.getenv("TELEGRAM_CHAT_ID"))), 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
