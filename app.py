@@ -910,13 +910,25 @@ def observer_webhook():
     if not expected or not supplied or not hmac.compare_digest(supplied, expected):
         return jsonify(error="Unauthorized"), 401
 
-    if not os.getenv("TELEGRAM_BOT_TOKEN") or not os.getenv("TELEGRAM_CHAT_ID"):
-        return jsonify(error="Telegram ortam değişkenleri eksik"), 503
+    action = str(data.get("action", "")).strip().lower()
+    side = str(data.get("side", "")).strip().upper()
+    exit_actions = {
+        "tp1", "tp2", "tp3", "stop", "trail_exit", "trail_update", "close",
+        "take_profit1", "take_profit2", "take_profit3",
+    }
+    exit_sides = {"STOP", "TP1", "TP2", "TP3", "TRAIL_EXIT"}
+    if action in exit_actions or side in exit_sides:
+        return jsonify(status="ignored", reason="exit_management_event",
+                       mode="telegram_observation_only",
+                       binance_orders_enabled=False), 200
 
     try:
         signal_data = normalize_observer_signal(data)
     except (ValueError, TypeError) as exc:
         return jsonify(error=str(exc)), 400
+
+    if not os.getenv("TELEGRAM_BOT_TOKEN") or not os.getenv("TELEGRAM_CHAT_ID"):
+        return jsonify(error="Telegram ortam değişkenleri eksik"), 503
 
     if observer_is_duplicate(signal_data):
         return jsonify(status="duplicate", mode="telegram_observation_only"), 200
@@ -945,11 +957,11 @@ def observer_health():
 def webhook():
     try:
         raw_body = request.get_data(as_text=True)
-        log.info(f"RAW: {raw_body[:500]}")
+        log.info("Webhook received: bytes=%d", len(raw_body))
 
         data = request.get_json(force=True, silent=True)
         if not data:
-            log.error(f"JSON okunamadı: {raw_body[:300]}")
+            log.error("JSON okunamadı")
             return jsonify({"error": "Geçersiz JSON"}), 400
 
         expected = os.environ.get("WEBHOOK_SECRET", "")
