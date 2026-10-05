@@ -1,0 +1,1233 @@
+//@version=5
+
+indicator("Trader Edition — Pump Early v2.3.4.4 SELECTIVE — 15M PRESET — Long Only", overlay=true, max_labels_count=500, max_lines_count=500)
+
+
+
+// ═══════════════════════════════════════════════════════════════
+
+// SUNUCU / WEBHOOK
+
+// ═══════════════════════════════════════════════════════════════
+
+webhookLong   = input.string("https://botreel-a358026a490c.herokuapp.com/observer/webhook", "Long Bot Webhook URL", group="🔐 SUNUCU", display=display.none)
+
+webhookSecret = input.string("", "Webhook Secret Token", group="🔐 SUNUCU", display=display.none)
+
+
+
+// Mevcut Python/Heroku yapısıyla uyumluluk için payload alanları korunmuştur.
+
+APIKEY     = input.string("", "Binance API Key", group="🔑 BİNANCE", display=display.none)
+
+SECRETKEY  = input.string("", "Binance Secret Key", group="🔑 BİNANCE", display=display.none)
+
+quantity   = input.float(50, "İşlem Miktarı (USDT)", minval=0.0, group="🔑 BİNANCE")
+
+leverage   = input.float(1.0, "Kaldıraç (x)", minval=1.0, group="🔑 BİNANCE")
+
+testnet    = input.bool(true, "Testnet Kullan", group="🔑 BİNANCE")
+
+tgBotToken = input.string("", "Bot Token", group="📱 TELEGRAM", display=display.none)
+
+tgChatId   = input.string("", "Chat ID", group="📱 TELEGRAM", display=display.none)
+
+
+
+// ═══════════════════════════════════════════════════════════════
+
+// ZAMAN FİLTRESİ — KRİPTO İÇİN VARSAYILAN KAPALI
+
+// ═══════════════════════════════════════════════════════════════
+
+useTimeFilter   = input.bool(false, "Zaman Filtresini Kullan", group="⏰ ZAMAN")
+
+marketHours     = input.session("0000-2359", "İşlem Saatleri", group="⏰ ZAMAN")
+
+inMarketHours   = not na(time(timeframe.period, marketHours))
+
+timeOK          = not useTimeFilter or inMarketHours
+
+
+
+// ═══════════════════════════════════════════════════════════════
+
+// RİSK YÖNETİMİ
+
+// ═══════════════════════════════════════════════════════════════
+
+accountBalance = input.float(1000, "Hesap Bakiyesi (USDT)", step=1, minval=1, group="💰 RİSK")
+
+riskPercent    = input.float(1.0, "İşlem Başı Risk (%)", minval=0.01, step=0.1, group="💰 RİSK")
+
+slTpMode       = input.string("ATR", "SL / TP Modu", options=["ATR", "Yüzde %"], group="💰 RİSK")
+
+isPctMode      = slTpMode == "Yüzde %"
+
+trailAfterTP1  = input.bool(true, "TP1 Sonrası Trailing Başlat", group="💰 RİSK")
+
+allowReEntry   = input.bool(false, "Pozisyon Açıkken Yeniden Giriş İzni", group="💰 RİSK")
+
+
+
+atrLen          = input.int(10, "ATR Uzunluğu", minval=1, group="💰 RİSK — ATR Modu")
+
+slAtrMult       = input.float(2.2, "SL — ATR Çarpanı", step=0.1, minval=0.1, group="💰 RİSK — ATR Modu")
+
+tp1AtrMult      = input.float(5.0, "TP1 — ATR Çarpanı", step=0.1, minval=0.1, group="💰 RİSK — ATR Modu")
+
+tp2AtrMult      = input.float(9.0, "TP2 — ATR Çarpanı", step=0.1, minval=0.1, group="💰 RİSK — ATR Modu")
+
+tp3AtrMult      = input.float(19.0, "TP3 — ATR Çarpanı", step=0.1, minval=0.1, group="💰 RİSK — ATR Modu")
+
+trailAtrMult    = input.float(1.6, "Trail — ATR (TP1 sonrası)", step=0.1, minval=0.05, group="💰 RİSK — ATR Modu")
+
+trailAtrMultTP2 = input.float(1.3, "Trail — ATR (TP2 sonrası)", step=0.1, minval=0.05, group="💰 RİSK — ATR Modu")
+
+trailAtrMultTP3 = input.float(1.0, "Trail — ATR (TP3 sonrası)", step=0.1, minval=0.05, group="💰 RİSK — ATR Modu")
+
+beOffsetMult    = input.float(-0.20, "TP1 Sonrası Koruma Offset — ATR", step=0.05, group="💰 RİSK — ATR Modu")
+
+beOffsetMult2   = input.float(0.45, "TP2 Sonrası Kilit Kâr — ATR", step=0.1, group="💰 RİSK — ATR Modu")
+
+
+
+slPct          = input.float(1.8, "SL — Yüzde %", step=0.1, minval=0.01, group="💰 RİSK — Yüzde Modu")
+
+tp1Pct         = input.float(2.5, "TP1 — Yüzde %", step=0.1, minval=0.01, group="💰 RİSK — Yüzde Modu")
+
+tp2Pct         = input.float(4.5, "TP2 — Yüzde %", step=0.1, minval=0.01, group="💰 RİSK — Yüzde Modu")
+
+tp3Pct         = input.float(7.5, "TP3 — Yüzde %", step=0.1, minval=0.01, group="💰 RİSK — Yüzde Modu")
+
+trailPct       = input.float(1.5, "Trail — Yüzde % (TP1 sonrası)", step=0.1, minval=0.01, group="💰 RİSK — Yüzde Modu")
+
+trailPctTP2    = input.float(1.2, "Trail — Yüzde % (TP2 sonrası)", step=0.05, minval=0.01, group="💰 RİSK — Yüzde Modu")
+
+trailPctTP3    = input.float(0.9, "Trail — Yüzde % (TP3 sonrası)", step=0.05, minval=0.01, group="💰 RİSK — Yüzde Modu")
+
+beOffsetPct    = input.float(-0.15, "TP1 Sonrası Koruma Offset — %", step=0.05, group="💰 RİSK — Yüzde Modu")
+
+beOffsetPct2   = input.float(0.35, "TP2 Sonrası Kilit Kâr — %", step=0.05, group="💰 RİSK — Yüzde Modu")
+
+// TREND HOLD: volatilite pump sırasında büyürse giriş ATR'si trail'i gereksiz daraltmasın.
+useDynamicTrailAtr = input.bool(true, "Trail İçin Dinamik ATR Kullan", group="🛡️ TREND HOLD EXIT")
+trailAtrCap        = input.float(2.0, "Dinamik ATR Üst Sınırı (Giriş ATR x)", step=0.1, minval=1.0, group="🛡️ TREND HOLD EXIT")
+postExitCooldown   = input.int(1, "Çıkış Sonrası Yeni Giriş Bekleme (bar)", minval=0, maxval=20, group="🛡️ TREND HOLD EXIT")
+holdWaveInPosition = input.bool(true, "Pozisyon Açıkken Wave Gate'i Kilitli Tut", group="🛡️ TREND HOLD EXIT")
+
+
+
+atr = ta.atr(atrLen)
+
+
+
+// ═══════════════════════════════════════════════════════════════
+
+// PUMP EARLY MOTORU — SETUP → ARM → TRIGGER
+
+// ═══════════════════════════════════════════════════════════════
+
+bbLength       = input.int(20, "BB Length", minval=5, group="🚀 PUMP EARLY")
+
+bbMult         = input.float(1.5, "BB Mult", step=0.1, group="🚀 PUMP EARLY")
+
+kcLength       = input.int(20, "KC Length", minval=5, group="🚀 PUMP EARLY")
+
+kcMult         = input.float(1.5, "KC Mult", step=0.1, group="🚀 PUMP EARLY")
+
+maxBBWidthPct  = input.float(4.0, "Maks. BB Genişliği %", step=0.1, minval=0.1, group="🚀 PUMP EARLY")
+
+armBars        = input.int(5, "Sıkışma Sonrası Hazır Kalma (bar)", minval=1, group="🚀 PUMP EARLY")
+
+
+
+volLength       = input.int(20, "Hacim Ortalama", minval=5, group="🚀 PUMP EARLY")
+
+quietVolBars    = input.int(5, "Önceki Sakin Hacim Barı", minval=2, group="🚀 PUMP EARLY")
+
+quietVolMax     = input.float(1.00, "Sakin Hacim Maks. x Ortalama", step=0.05, minval=0.1, group="🚀 PUMP EARLY")
+
+volumeTrigger   = input.float(1.15, "Tetik Hacmi Min. x Ortalama", step=0.05, minval=0.1, group="🚀 PUMP EARLY")
+
+
+
+rsiLength       = input.int(14, "RSI Length", minval=2, group="🚀 PUMP EARLY")
+
+rsiEarlyMin     = input.float(52, "RSI Erken Alt Sınır", step=1, group="🚀 PUMP EARLY")
+
+rsiMax          = input.float(74, "RSI Üst Sınır", step=1, group="🚀 PUMP EARLY")
+
+
+
+macdFast        = input.int(12, "MACD Fast", minval=1, group="🚀 PUMP EARLY")
+
+macdSlow        = input.int(26, "MACD Slow", minval=2, group="🚀 PUMP EARLY")
+
+macdSignalLen   = input.int(9, "MACD Signal", minval=1, group="🚀 PUMP EARLY")
+
+
+
+atrCompressionLen = input.int(20, "ATR Sıkışma Ortalama", minval=5, group="🚀 PUMP EARLY")
+
+atrCompressionMax = input.float(1.05, "ATR / ATR Ort. Maks.", step=0.05, minval=0.1, group="🚀 PUMP EARLY")
+
+breakoutLen        = input.int(6, "Mini Direnç Bakış Barı", minval=2, group="🚀 PUMP EARLY")
+
+emaFastLen         = input.int(9, "Hızlı EMA", minval=1, group="🚀 PUMP EARLY")
+
+emaSlowLen         = input.int(21, "Yavaş EMA", minval=2, group="🚀 PUMP EARLY")
+
+minBodyPct         = input.float(0.20, "Min. Tetik Mum %", step=0.05, group="🚀 PUMP EARLY")
+
+maxBodyPct         = input.float(5.00, "Maks. Tetik Mum % (kovalamayı engeller)", step=0.1, group="🚀 PUMP EARLY")
+
+prePumpScoreMin    = input.int(5, "PRE-PUMP Min. Skor", minval=1, maxval=11, group="🚀 PUMP EARLY")
+
+triggerScoreMin    = input.int(8, "LONG Min. Skor", minval=1, maxval=11, group="🚀 PUMP EARLY")
+
+showPrePump        = input.bool(false, "PRE-PUMP İşaretlerini Göster", group="🚀 PUMP EARLY")
+
+// ═══════════════════════════════════════════════════════════════
+// KADEMELİ GİRİŞ MOTORU — şartların aynı mumda oluşmasını beklemez
+// S1: sıkışma/setup hafızası
+// S2: hacim veya momentum uyanışı
+// S3: hacim + momentum hafızası tamam; trend/trigger beklenir
+// LONG: S3 + trend + kaliteli yeşil mum + kovalamama filtresi
+// ═══════════════════════════════════════════════════════════════
+entryEngineMode    = input.string("KADEMELİ", "Giriş Motoru", options=["KADEMELİ", "STRICT v2"], group="🪜 KADEMELİ GİRİŞ")
+stageSetupTTL       = input.int(5, "S1 Sıkışma Hafızası (bar)", minval=2, maxval=30, group="🪜 KADEMELİ GİRİŞ")
+stageEvidenceTTL    = input.int(4, "S2 Hacim/Momentum Toplama (bar)", minval=2, maxval=20, group="🪜 KADEMELİ GİRİŞ")
+stageTrendTTL       = input.int(2, "S3 Trend Tetik Bekleme (bar)", minval=1, maxval=10, group="🪜 KADEMELİ GİRİŞ")
+stageMaxChaseAtr    = input.float(1.5, "Maks. EMA9 Uzaklığı (ATR)", step=0.1, minval=0.5, maxval=5.0, group="🪜 KADEMELİ GİRİŞ")
+stageRsiHardMax     = input.float(74.0, "Maks. Anlık RSI (tepe kovalamama)", step=1.0, minval=55, maxval=90, group="🪜 KADEMELİ GİRİŞ")
+stageMinScore       = input.int(7, "Normal LONG Min. Anlık Skor", minval=4, maxval=11, group="🪜 KADEMELİ GİRİŞ")
+stageSeedQuietReq   = input.bool(true, "S1 İçin Sakinlik/ATR Sıkışması Ara", group="🪜 KADEMELİ GİRİŞ")
+stageSlowSlopeBars  = input.int(2, "EMA21 Eğim Kontrolü (bar)", minval=1, maxval=6, group="🪜 KADEMELİ GİRİŞ")
+stageLiveVolMin     = input.float(0.80, "S3 Anlık Canlı Hacim Min. x", step=0.05, minval=0.1, maxval=3.0, group="🪜 KADEMELİ GİRİŞ")
+stageFastBypassVol  = input.float(1.45, "IGNITION Hacim Min. x", step=0.05, minval=0.5, maxval=5.0, group="🪜 KADEMELİ GİRİŞ")
+stageRequireFresh   = input.bool(true, "LONG Anında Taze Momentum/Breakout İste", group="🪜 KADEMELİ GİRİŞ")
+stageRequireContext = input.bool(true, "EMA55 Context Gate Kullan", group="🪜 KADEMELİ GİRİŞ")
+stageContextEmaLen  = input.int(55, "Context EMA", minval=21, maxval=200, group="🪜 KADEMELİ GİRİŞ")
+stageContextSlopeBars = input.int(2, "Context EMA Eğim Kontrolü (bar)", minval=1, maxval=12, group="🪜 KADEMELİ GİRİŞ")
+stageContextGapAtr  = input.float(0.08, "EMA21-Context Min. Fark (ATR)", step=0.05, minval=0.0, maxval=2.0, group="🪜 KADEMELİ GİRİŞ")
+stageIgnitionLookback = input.int(8, "IGNITION Yapısal Breakout (bar)", minval=6, maxval=40, group="🪜 KADEMELİ GİRİŞ")
+stageIgnitionBodyAtr = input.float(0.40, "IGNITION Min. Mum Gövdesi (ATR)", step=0.05, minval=0.10, maxval=3.0, group="🪜 KADEMELİ GİRİŞ")
+
+// v2.3.4.4 SELECTIVE 15M PRESET: Ana giriş çekirdeği korunur; yalnız varsayılan zaman/hafıza ve risk parametreleri 15 dakikaya uyarlanır.
+// v2.3.4: Ana giriş çekirdeği v2.3.2 ile aynıdır.
+// EMA144 yalnızca zayıf lokal dönüşleri veto eder; güçlü breakout/IGNITION yolunu bloke etmez.
+stageBearGuardEnabled = input.bool(true, "Makro Ayı Zayıf-Sinyal Filtresi", group="🛡️ CORE PRESERVE")
+stageMacroEmaLen      = input.int(144, "Makro EMA", minval=55, maxval=300, group="🛡️ CORE PRESERVE")
+stageMacroSlopeBars   = input.int(3, "Makro Düşüş Kontrolü (bar)", minval=2, maxval=20, group="🛡️ CORE PRESERVE")
+stageBearEscapeVol    = input.float(1.30, "Ayı Rejim Güçlü Hacim Bypass x", step=0.05, minval=0.5, maxval=5.0, group="🛡️ CORE PRESERVE")
+stageBearEscapeScore  = input.int(9, "Ayı Rejim Güçlü Skor Bypass", minval=7, maxval=11, group="🛡️ CORE PRESERVE")
+
+showStageMarkers    = input.bool(false, "Kademe İşaretlerini Göster (debug)", group="🪜 KADEMELİ GİRİŞ")
+showContextEma      = input.bool(false, "Context EMA55 Göster (debug)", group="🪜 KADEMELİ GİRİŞ")
+showMacroEma        = input.bool(false, "Makro EMA144 Göster (debug)", group="🛡️ CORE PRESERVE")
+
+// ═══════════════════════════════════════════════════════════════
+// STRICT WAVE RESET — İLK SİNYALİ KORU, SADECE GERÇEK YENİ DALGADA TEKRAR GİR
+// ═══════════════════════════════════════════════════════════════
+waveGateEnabled        = input.bool(true, "LONG Wave Gate Kullan", group="🌊 STRICT WAVE RESET")
+waveResetConfirmBars    = input.int(2, "Reset Onay Barı", minval=1, maxval=5, group="🌊 STRICT WAVE RESET")
+waveMinBarsBetween      = input.int(2, "Dalgalar Arası Min. Bar", minval=1, maxval=20, group="🌊 STRICT WAVE RESET")
+waveMaxEntries          = input.int(2, "Trend Başına Maks. LONG", minval=1, maxval=5, group="🌊 STRICT WAVE RESET")
+waveRsiDropPts          = input.float(5.0, "Reset RSI Gevşeme (puan)", step=0.5, minval=1.0, group="🌊 STRICT WAVE RESET")
+waveRsiPeakLookback     = input.int(5, "RSI Tepe Bakış Barı", minval=3, maxval=20, group="🌊 STRICT WAVE RESET")
+waveTightBars           = input.int(2, "Reset Sıkışma Barı", minval=2, maxval=10, group="🌊 STRICT WAVE RESET")
+waveTightAtrMult        = input.float(1.5, "Reset Sıkışma Maks. ATR", step=0.1, minval=0.5, group="🌊 STRICT WAVE RESET")
+waveTrendResetRsi       = input.float(48.0, "Yeni Trend Reset RSI Altı", step=1.0, minval=20, maxval=60, group="🌊 STRICT WAVE RESET")
+waveRequireBreakoutNext = input.bool(true, "2./3. Dalga İçin Mini Breakout Zorunlu", group="🌊 STRICT WAVE RESET")
+showWaveReset           = input.bool(false, "Wave Reset İşaretini Göster", group="🌊 STRICT WAVE RESET")
+
+
+
+// Bollinger / Keltner
+
+bbBase  = ta.sma(close, bbLength)
+
+bbDev   = ta.stdev(close, bbLength) * bbMult
+
+bbUpper = bbBase + bbDev
+
+bbLower = bbBase - bbDev
+
+
+
+kcMiddle = ta.sma(close, kcLength)
+
+kcRange  = ta.atr(kcLength)
+
+kcUpper  = kcMiddle + kcRange * kcMult
+
+kcLower  = kcMiddle - kcRange * kcMult
+
+
+
+squeezeOn  = bbUpper < kcUpper and bbLower > kcLower
+
+bbWidthPct = bbBase != 0 ? (bbUpper - bbLower) / bbBase * 100 : 999.0
+
+bbNarrow   = bbWidthPct <= maxBBWidthPct
+
+setupNow   = squeezeOn or bbNarrow
+
+barsSinceSetup = nz(ta.barssince(setupNow), 10000)
+
+setupRecent = barsSinceSetup <= armBars
+
+
+
+// Hacim: önce sakin, sonra genişleme
+
+avgVolume   = ta.sma(volume, volLength)
+
+quietVolAvg = ta.sma(volume[1], quietVolBars)
+
+volumeQuiet = not na(quietVolAvg) and quietVolAvg <= avgVolume * quietVolMax
+
+volumeRatio = avgVolume > 0 ? volume / avgVolume : 0.0
+
+volumeExpansion = volumeRatio >= volumeTrigger
+
+
+
+// RSI ivmesi
+
+rsi = ta.rsi(close, rsiLength)
+
+rsiRising = rsi > rsi[1] and rsi[1] >= rsi[2]
+
+rsiEarly  = rsi >= rsiEarlyMin and rsi <= rsiMax and rsiRising
+
+
+
+// MACD ivmesi — sıfır çizgisini beklemez
+
+[macdLine, signalLine, _] = ta.macd(close, macdFast, macdSlow, macdSignalLen)
+
+macdHist  = macdLine - signalLine
+
+macdAccel = macdLine > signalLine and macdHist > macdHist[1] and macdHist[1] >= macdHist[2]
+
+
+
+// ATR sıkışması
+
+atrMean        = ta.sma(atr, atrCompressionLen)
+
+atrContracting = not na(atrMean) and atr <= atrMean * atrCompressionMax
+
+
+
+// Trend + mini direnç
+
+emaFast    = ta.ema(close, emaFastLen)
+
+emaSlow    = ta.ema(close, emaSlowLen)
+
+emaContext = ta.ema(close, stageContextEmaLen)
+emaMacro   = ta.ema(close, stageMacroEmaLen)
+
+trendOK  = emaFast > emaSlow and close > emaFast
+
+priorHigh = ta.highest(high[1], breakoutLen)
+
+breakout = not na(priorHigh) and close > priorHigh
+
+ignitionPriorHigh = ta.highest(high[1], stageIgnitionLookback)
+
+
+
+// Büyük pump mumunu kovalamayı engelle
+
+bodyChangePct = open != 0 ? (close - open) / open * 100 : 0.0
+
+bodyAtr       = atr > 0 ? math.abs(close - open) / atr : 0.0
+
+bullishBody   = close > open and bodyChangePct >= minBodyPct and bodyChangePct <= maxBodyPct
+
+
+
+// 11 puanlık skor
+
+int pumpScore = 0
+
+pumpScore += setupRecent      ? 2 : 0
+
+pumpScore += bbNarrow         ? 1 : 0
+
+pumpScore += atrContracting   ? 1 : 0
+
+pumpScore += rsiEarly         ? 1 : 0
+
+pumpScore += macdAccel        ? 1 : 0
+
+pumpScore += volumeExpansion  ? 2 : 0
+
+pumpScore += trendOK          ? 1 : 0
+
+pumpScore += breakout         ? 2 : 0
+
+
+
+prePumpRaw = setupRecent and volumeQuiet and pumpScore >= prePumpScoreMin
+
+prePumpSignal = prePumpRaw and not prePumpRaw[1]
+
+
+
+// STRICT v2 çekirdeği referans olarak korunur.
+// KADEMELİ modda bu şartların aynı barda oluşması gerekmez; aşağıdaki state-machine
+// setup → hacim/momentum hafızası → trend tetik sırasıyla çalışır.
+longSignal = timeOK and setupRecent and rsiEarly and macdAccel and volumeExpansion and trendOK and bullishBody and pumpScore >= triggerScoreMin
+
+
+// ═══════════════════════════════════════════════════════════════
+// STRICT WAVE RESET
+// W1: orijinal longSignal doğrudan geçer — giriş çekirdeğine dokunulmaz.
+// W2/W3: yeni dalga sayılabilmesi için 4 reset koşulundan en az 3'ü gerekir:
+//   1) EMA9/EMA21 bölgesine pullback
+//   2) RSI son tepesinden belirgin gevşeme
+//   3) MACD histogramında gerçek soğuma
+//   4) kısa fiyat sıkışması
+// Reset onaylandıktan sonra orijinal longSignal + mini breakout + hacim ile yeni dalga açılır.
+// Ana trend sayacı yalnız EMA9<EMA21 + RSI<48 + MACD<=0 üçlüsünde W1'e döner.
+// ═══════════════════════════════════════════════════════════════
+// Pozisyon farkındalığı: aktif trade varken yeni LONG çizimi/yeniden-arm engellenir.
+var bool managedTradeActive = false
+var int  lastManagedExitBar = na
+
+var bool waveLocked       = false
+var int  waveCount        = 0
+var int  waveResetCount   = 0
+var int  lastWaveEntryBar = na
+
+bool waveRearmed = false
+
+// 1) Fiyat hızlı/yavaş EMA bölgesine geri dönmüş mü?
+wavePullback = low <= emaFast or close <= emaFast or low <= emaSlow
+
+// 2) RSI, yakın zamandaki zirvesinden yeterince gevşemiş mi?
+waveRsiPeak = ta.highest(rsi, waveRsiPeakLookback)
+waveRsiCool = not na(waveRsiPeak) and (waveRsiPeak - rsi >= waveRsiDropPts)
+
+// 3) MACD histogramı en az iki bardır ivme kaybediyor mu veya sıfırın altına indi mi?
+waveMacdCool = macdHist <= 0 or (macdHist < macdHist[1] and macdHist[1] <= macdHist[2])
+
+// 4) Yeniden patlamadan önce kısa bir sıkışma oluşmuş mu?
+waveTightRange = ta.highest(high, waveTightBars) - ta.lowest(low, waveTightBars)
+waveTight = not na(waveTightRange) and waveTightRange <= atr * waveTightAtrMult
+
+waveResetScore = (wavePullback ? 1 : 0) + (waveRsiCool ? 1 : 0) + (waveMacdCool ? 1 : 0) + (waveTight ? 1 : 0)
+waveResetRaw   = waveResetScore >= 3
+
+// Eski "EMA21 altında N bar" reseti kaldırıldı.
+// Yeni ana trend reseti: momentum ve EMA yapısı birlikte gerçekten bozulmalı.
+fullTrendReset = emaFast < emaSlow and rsi < waveTrendResetRsi and macdHist <= 0
+
+if waveGateEnabled and fullTrendReset and (not holdWaveInPosition or not managedTradeActive)
+    waveLocked       := false
+    waveCount        := 0
+    waveResetCount   := 0
+    lastWaveEntryBar := na
+
+barsFromLastWave = na(lastWaveEntryBar) ? 100000 : bar_index - lastWaveEntryBar
+
+if waveGateEnabled and waveLocked and not fullTrendReset and (not holdWaveInPosition or not managedTradeActive)
+    if barsFromLastWave >= waveMinBarsBetween
+        waveResetCount := waveResetRaw ? waveResetCount + 1 : 0
+        if waveResetCount >= waveResetConfirmBars and waveCount < waveMaxEntries
+            waveLocked     := false
+            waveResetCount := 0
+            waveRearmed    := true
+    else
+        waveResetCount := 0
+else if waveGateEnabled and not waveLocked
+    waveResetCount := 0
+
+// ═══════════════════════════════════════════════════════════════
+// KADEMELİ GİRİŞ STATE MACHINE
+// Aynı mumda squeeze + hacim + RSI + MACD + trend aramak yerine kanıtları birkaç bar
+// boyunca hafızada tutar. Ancak fiyat EMA9'dan fazla uzaklaşırsa tepe kovalamaz.
+// ═══════════════════════════════════════════════════════════════
+var int  stagedState        = 0
+var int  stagedSetupBar     = na
+var int  stagedEvidenceBar  = na
+var int  stagedConfirmBar   = na
+var bool stagedVolumeSeen   = false
+var bool stagedMomentumSeen = false
+
+bool stageS1Pulse = false
+bool stageS2Pulse = false
+bool stageS3Pulse = false
+
+stagedMode       = entryEngineMode == "KADEMELİ"
+stageCanBuild    = not managedTradeActive and (not waveGateEnabled or not waveLocked)
+stageSeedQuality = not stageSeedQuietReq or volumeQuiet or atrContracting
+stageSeed        = (setupRecent and stageSeedQuality) or waveRearmed
+stageMomentumNow = rsiEarly or macdAccel
+
+// Motor kapalıysa veya mevcut pozisyon/wave kilidi varsa eski kanıtı taşımayız.
+if not stagedMode or not stageCanBuild
+    stagedState        := 0
+    stagedSetupBar     := na
+    stagedEvidenceBar  := na
+    stagedConfirmBar   := na
+    stagedVolumeSeen   := false
+    stagedMomentumSeen := false
+else
+    // S1 — Sıkışma/setup yakalandı.
+    if stagedState == 0 and stageSeed
+        stagedState        := 1
+        stagedSetupBar     := setupRecent ? bar_index - barsSinceSetup : bar_index
+        stagedEvidenceBar  := na
+        stagedConfirmBar   := na
+        stagedVolumeSeen   := false
+        stagedMomentumSeen := false
+        stageS1Pulse       := true
+
+    // S1 hafızası içinde hacim veya momentumun ilk uyanışını bekle.
+    if stagedState == 1
+        if bar_index - stagedSetupBar > stageSetupTTL
+            stagedState        := 0
+            stagedSetupBar     := na
+            stagedVolumeSeen   := false
+            stagedMomentumSeen := false
+        else
+            stagedVolumeSeen   := stagedVolumeSeen or volumeExpansion
+            stagedMomentumSeen := stagedMomentumSeen or stageMomentumNow
+            if stagedVolumeSeen or stagedMomentumSeen
+                stagedState       := 2
+                stagedEvidenceBar := bar_index
+                stageS2Pulse      := true
+
+    // S2 — Hacim ve momentum aynı barda olmak zorunda değil; TTL içinde ikisini tamamla.
+    if stagedState == 2
+        stagedVolumeSeen   := stagedVolumeSeen or volumeExpansion
+        stagedMomentumSeen := stagedMomentumSeen or stageMomentumNow
+        if bar_index - stagedEvidenceBar > stageEvidenceTTL
+            stagedState        := 0
+            stagedSetupBar     := na
+            stagedEvidenceBar  := na
+            stagedVolumeSeen   := false
+            stagedMomentumSeen := false
+        else if stagedVolumeSeen and stagedMomentumSeen
+            stagedState      := 3
+            stagedConfirmBar := bar_index
+            stageS3Pulse     := true
+
+    // S3 — Trend tetik penceresi. Süre aşarsa eski setup kovalanmaz.
+    if stagedState == 3 and bar_index - stagedConfirmBar > stageTrendTTL
+        stagedState        := 0
+        stagedSetupBar     := na
+        stagedEvidenceBar  := na
+        stagedConfirmBar   := na
+        stagedVolumeSeen   := false
+        stagedMomentumSeen := false
+
+stagedChaseOK       = close <= emaFast + atr * stageMaxChaseAtr
+stagedHeatOK        = rsi <= stageRsiHardMax
+stageSlowSlopeOK    = emaSlow >= emaSlow[stageSlowSlopeBars]
+stageLiveMomentumOK = rsi > rsi[1] or macdHist > macdHist[1]
+
+// v2.3.2 CONTEXT GATE
+// Normal LONG artık yalnızca orta vadeli yapı gerçekten yukarı döndüyse geçer.
+// Böylece LONGXIA/MOVR/HEI gibi uzun yatay-aşağı bölgelerdeki lokal EMA9>EMA21 yalancı tetikleri süzülür.
+stageContextSlopeOK = emaContext >= emaContext[stageContextSlopeBars]
+stageContextGapOK   = emaSlow > emaContext and (emaSlow - emaContext) >= atr * stageContextGapAtr
+stageNormalContextOK = close > emaContext and stageContextSlopeOK and stageContextGapOK
+
+// IGNITION istisnası: Context EMA henüz dönmemiş olsa bile gerçek ateşlemeyi kaçırma.
+// 12-bar yapısal kırılım + güçlü hacim + anlamlı gövde + momentum şartı gerekir.
+stageIgnitionBreakout = not na(ignitionPriorHigh) and close > ignitionPriorHigh
+stageIgnition = stageIgnitionBreakout and volumeRatio >= stageFastBypassVol and bodyAtr >= stageIgnitionBodyAtr and stageMomentumNow and trendOK and bullishBody
+
+stageContextOK      = not stageRequireContext or stageNormalContextOK or stageIgnition
+stageStrongBreakout = stageIgnition
+stageTrendQualityOK = trendOK and stageContextOK and (stageSlowSlopeOK or stageIgnition)
+stageFreshTriggerOK = not stageRequireFresh or stageIgnition or breakout or (volumeRatio >= stageLiveVolMin and stageLiveMomentumOK)
+stageScoreOK        = pumpScore >= stageMinScore or stageIgnition
+
+// v2.3.4 CORE PRESERVE GUARD
+// Ana giriş yapısına dokunmuyoruz. Sadece makro EMA144 belirgin aşağı eğimli ve fiyat altında ise,
+// breakout/IGNITION/yüksek hacim/yüksek skor taşımayan ZAYIF lokal dönüşleri veto ediyoruz.
+stageMacroBear      = close < emaMacro and emaMacro < emaMacro[stageMacroSlopeBars]
+stageBearEscapeOK   = stageIgnition or breakout or volumeRatio >= stageBearEscapeVol or pumpScore >= stageBearEscapeScore
+stageWeakBounceVeto = stageBearGuardEnabled and stageMacroBear and not stageBearEscapeOK
+stageNoiseGateOK    = not stageWeakBounceVeto
+
+// v2.3.4: v2.3.2 giriş çekirdeği birebir korunur; sadece en sona yumuşak noise veto eklenir.
+stagedLongSignal = stagedMode and stagedState == 3 and timeOK and stagedVolumeSeen and stagedMomentumSeen and stageTrendQualityOK and bullishBody and stagedChaseOK and stagedHeatOK and stageFreshTriggerOK and stageScoreOK and stageNoiseGateOK
+entryCoreSignal   = stagedMode ? stagedLongSignal : longSignal
+
+isFirstWave        = waveCount == 0
+nextWaveBreakoutOK = isFirstWave or not waveRequireBreakoutNext or breakout
+
+// W2/W3 için yeni dalga kapısı korunur. KADEMELİ modda hacim kanıtı state-machine hafızasında olabilir.
+nextWaveVolumeOK = isFirstWave or (stagedMode ? stagedVolumeSeen : volumeExpansion)
+
+// SEÇİCİ 15DK GİRİŞ: tüm giriş yollarına uygulanır; IGNITION atlayamaz.
+observerAdxLength = input.int(14, "Gözlem ADX uzunluğu", minval=2, maxval=200, group="📡 GÖZLEM JSON")
+observerAdxSmoothing = input.int(14, "Gözlem ADX yumuşatma", minval=2, maxval=200, group="📡 GÖZLEM JSON")
+[observerPlusDI, observerMinusDI, observerAdx] = ta.dmi(observerAdxLength, observerAdxSmoothing)
+qualityEnabled = input.bool(true, "Seçici giriş filtresi", group="🎯 SEÇİCİ 15DK")
+qualityOnly15m = input.bool(true, "Yalnız 15dk giriş", group="🎯 SEÇİCİ 15DK")
+qualityScoreMin = input.int(9, "Min. Pump skor", minval=1, maxval=11, group="🎯 SEÇİCİ 15DK")
+qualityVolumeMin = input.float(1.8, "Min. giriş hacmi x", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
+qualityRsiMin = input.float(54, "Min. RSI", minval=0, maxval=100, group="🎯 SEÇİCİ 15DK")
+qualityRsiMax = input.float(72, "Maks. RSI", minval=0, maxval=100, group="🎯 SEÇİCİ 15DK")
+qualityAdxMin = input.float(18, "Min. ADX", minval=0, maxval=100, group="🎯 SEÇİCİ 15DK")
+qualityBodyPctMax = input.float(3, "Maks. giriş mum gövdesi %", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
+qualityBodyAtrMax = input.float(1.8, "Maks. gövde / önceki ATR", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
+qualityChaseAtrMax = input.float(1.2, "Maks. EMA9 uzaklığı / önceki ATR", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
+qualityCloseMin = input.float(0.65, "Min. mum kapanış konumu (0–1)", minval=0.1, maxval=1, step=0.05, group="🎯 SEÇİCİ 15DK")
+qualityBaseBars = input.int(12, "Sakin bölge bakışı (bar)", minval=4, maxval=96, group="🎯 SEÇİCİ 15DK")
+qualityBaseAtrMax = input.float(6, "Sakin bölge genişliği / önceki ATR", minval=1, step=0.5, group="🎯 SEÇİCİ 15DK")
+qualityBaseTTL = input.int(4, "Sakin bölge hafızası (bar)", minval=0, maxval=12, group="🎯 SEÇİCİ 15DK")
+qualityBreakBars = input.int(8, "Taze kırılım bakışı (bar)", minval=3, maxval=40, group="🎯 SEÇİCİ 15DK")
+qualityBreakTTL = input.int(2, "Kırılımdan sonra en çok bar", minval=0, maxval=5, group="🎯 SEÇİCİ 15DK")
+qualityBreakAtrMax = input.float(1.2, "Kırılım üstünde maks. uzaklık / önceki ATR", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
+qualityCooldownBars = input.int(32, "Aynı paritede giriş aralığı (bar)", minval=1, maxval=400, group="🎯 SEÇİCİ 15DK")
+qualityRRMin = input.float(1.5, "Min. TP1 risk/getiri", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
+
+qualityAtrRef = atr[1]
+qualityRangeWidth = ta.highest(high[1], qualityBaseBars) - ta.lowest(low[1], qualityBaseBars)
+qualityBaseNow = not na(qualityAtrRef) and qualityAtrRef > 0 and qualityRangeWidth <= qualityBaseAtrMax * qualityAtrRef
+qualityBaseAge = ta.barssince(qualityBaseNow)
+qualityBaseRecent = not na(qualityBaseAge) and qualityBaseAge <= qualityBaseTTL
+qualityPriorHigh = ta.highest(high[1], qualityBreakBars)
+qualityBreakNow = close > qualityPriorHigh and close[1] <= qualityPriorHigh[1]
+qualityBreakAge = ta.barssince(qualityBreakNow)
+qualityBreakFresh = not na(qualityBreakAge) and qualityBreakAge <= qualityBreakTTL and close > qualityPriorHigh
+qualityRR = isPctMode ? tp1Pct / slPct : tp1AtrMult / slAtrMult
+qualityBodyAtr = qualityAtrRef > 0 ? math.abs(close - open) / qualityAtrRef : na
+qualityChaseAtr = qualityAtrRef > 0 ? math.max(0, close - emaFast) / qualityAtrRef : na
+qualityBreakAtr = qualityAtrRef > 0 ? math.max(0, close - qualityPriorHigh) / qualityAtrRef : na
+qualityClosePos = high > low ? (close - low) / (high - low) : 0.0
+qualityTrendOK = emaFast > emaSlow and close > emaFast and emaSlow > emaSlow[2] and close > emaContext and emaContext > emaContext[2]
+qualityMomentumOK = rsi >= qualityRsiMin and rsi <= qualityRsiMax and rsi > rsi[1] and observerAdx >= qualityAdxMin and observerPlusDI > observerMinusDI and macdHist > 0 and macdHist > macdHist[1]
+qualityCandleOK = close > open and bodyChangePct <= qualityBodyPctMax and qualityBodyAtr <= qualityBodyAtrMax and qualityClosePos >= qualityCloseMin
+qualityDataOK = pumpScore >= qualityScoreMin and volumeRatio >= qualityVolumeMin and qualityRR >= qualityRRMin
+qualityLocationOK = qualityBaseRecent and qualityBreakFresh and qualityChaseAtr <= qualityChaseAtrMax and qualityBreakAtr <= qualityBreakAtrMax
+var int qualityLastEntryBar = na
+qualityCooldownOK = na(qualityLastEntryBar) or bar_index - qualityLastEntryBar >= qualityCooldownBars
+qualityEntryPassed = not qualityEnabled or ((not qualityOnly15m or timeframe.period == "15") and qualityTrendOK and qualityMomentumOK and qualityCandleOK and qualityDataOK and qualityLocationOK and qualityCooldownOK)
+
+// Wave Gate kapalıysa seçilen giriş motorunun ham davranışı kullanılır.
+postExitReady = na(lastManagedExitBar) or bar_index - lastManagedExitBar >= postExitCooldown
+rawWaveEntryPulse = waveGateEnabled ? (entryCoreSignal and not waveLocked and waveCount < waveMaxEntries and nextWaveBreakoutOK and nextWaveVolumeOK) : entryCoreSignal
+longEntryPulse = barstate.isconfirmed and rawWaveEntryPulse and qualityEntryPassed and postExitReady and (allowReEntry or not managedTradeActive)
+
+if longEntryPulse
+    qualityLastEntryBar := bar_index
+
+if waveGateEnabled and longEntryPulse
+    waveCount        += 1
+    waveLocked       := true
+    lastWaveEntryBar := bar_index
+    waveResetCount   := 0
+
+// Girişten sonra eski kademeleri temizle; yeni işlem ancak gerçek wave reset sonrası yeniden hazırlanır.
+if longEntryPulse and stagedMode
+    stagedState        := 0
+    stagedSetupBar     := na
+    stagedEvidenceBar  := na
+    stagedConfirmBar   := na
+    stagedVolumeSeen   := false
+    stagedMomentumSeen := false
+
+
+plotshape(showPrePump and prePumpSignal, title="PRE-PUMP", text="PRE", style=shape.labelup, location=location.belowbar, color=color.yellow, textcolor=color.black, size=size.tiny)
+plotshape(showStageMarkers and stageS1Pulse, title="S1 SIKIŞMA", text="S1", style=shape.labelup, location=location.belowbar, color=color.new(color.yellow, 10), textcolor=color.black, size=size.tiny)
+plotshape(showStageMarkers and stageS2Pulse, title="S2 UYANIŞ", text="S2", style=shape.labelup, location=location.belowbar, color=color.new(color.orange, 5), textcolor=color.black, size=size.tiny)
+plotshape(showStageMarkers and stageS3Pulse, title="S3 TEYİT", text="S3", style=shape.labelup, location=location.belowbar, color=color.new(color.aqua, 5), textcolor=color.black, size=size.tiny)
+plotshape(longEntryPulse, title="LONG WAVE ENTRY", text="LONG", style=shape.triangleup, location=location.belowbar, color=color.lime, textcolor=color.black, size=size.small)
+plotshape(showWaveReset and waveRearmed, title="WAVE RESET", text="RESET", style=shape.labelup, location=location.belowbar, color=color.orange, textcolor=color.black, size=size.tiny)
+
+
+
+plot(emaFast, "EMA Fast", color=color.new(color.teal, 65))
+
+plot(emaSlow, "EMA Slow", color=color.new(color.blue, 75))
+
+plot(showContextEma ? emaContext : na, "EMA Context", color=color.new(color.purple, 55), linewidth=2)
+plot(showMacroEma ? emaMacro : na, "EMA Macro", color=color.new(color.gray, 60), linewidth=2)
+
+
+
+// ═══════════════════════════════════════════════════════════════
+
+// WEBHOOK YARDIMCI
+
+// ═══════════════════════════════════════════════════════════════
+
+ADET = str.tostring(quantity)
+
+LVG  = str.tostring(leverage)
+
+TNT  = testnet ? "true" : "false"
+
+
+
+// Gözlem verileri: çekirdek giriş/çıkış koşulları değiştirilmez.
+observerAvgRange = ta.sma(high[1] - low[1], volLength)
+observerRangeMult = observerAvgRange > 0 ? (high - low) / observerAvgRange : na
+observerRangeLow = ta.lowest(low[1], breakoutLen)
+observerTrend = emaFast > emaSlow and close > emaSlow ? "LONG" : emaFast < emaSlow and close < emaSlow ? "SHORT" : "FLAT"
+
+_jsonNum(float value) =>
+    na(value) ? "null" : str.tostring(value, "#.##########")
+
+_jsonText(string value) =>
+    str.replace_all(str.replace_all(str.replace_all(str.replace_all(value, "\\", "\\\\"), "\"", "\\\""), "\n", "\\n"), "\r", "\\r")
+
+_base(string eventName) =>
+ '"ticker":"' + _jsonText(syminfo.ticker) + '"' + ',' +
+ '"symbol":"' + _jsonText(syminfo.ticker) + '"' + ',' +
+ '"exchange":"' + _jsonText(syminfo.prefix) + '"' + ',' +
+ '"strategyVersion":"' + _jsonText("2.3.4.4-selective") + '"' + ',' +
+ '"signalId":"' + _jsonText(syminfo.tickerid + ":" + timeframe.period + ":" + str.tostring(time) + ":" + eventName) + '"' + ',' +
+ '"webhookSecret":"' + _jsonText(webhookSecret) + '"' + ',' +
+ '"interval":"' + _jsonText(timeframe.period) + '"' + ',' +
+ '"signalTime":' + _jsonNum(timenow) + ',' +
+ '"barTime":' + _jsonNum(time) + ',' +
+ '"barCloseTime":' + _jsonNum(time_close) + ',' +
+ '"price":' + _jsonNum(close) + ',' +
+ '"open":' + _jsonNum(open) + ',' +
+ '"high":' + _jsonNum(high) + ',' +
+ '"low":' + _jsonNum(low) + ',' +
+ '"pumpScore":' + _jsonNum(pumpScore) + ',' +
+ '"bbWidthPct":' + _jsonNum(bbWidthPct) + ',' +
+ '"volumeRatio":' + _jsonNum(volumeRatio) + ',' +
+ '"rsi":' + _jsonNum(rsi) + ',' +
+ '"adx":' + _jsonNum(observerAdx) + ',' +
+ '"entryMovePct":' + _jsonNum(bodyChangePct) + ',' +
+ '"rangeMult":' + _jsonNum(observerRangeMult) + ',' +
+ '"rangeHigh":' + _jsonNum(priorHigh) + ',' +
+ '"rangeLow":' + _jsonNum(observerRangeLow) + ',' +
+ '"emaFast":' + _jsonNum(emaFast) + ',' +
+ '"emaSlow":' + _jsonNum(emaSlow) + ',' +
+ '"emaTrend":"' + _jsonText(observerTrend) + '"' + ',' +
+ '"breakoutConfirmed":' + (breakout ? 'true' : 'false') + ',' +
+ '"barConfirmed":' + (barstate.isconfirmed ? 'true' : 'false') + ',' +
+ '"rsiLength":' + _jsonNum(rsiLength) + ',' +
+ '"adxLength":' + _jsonNum(observerAdxLength) + ',' +
+ '"adxSmoothing":' + _jsonNum(observerAdxSmoothing) + ',' +
+ '"atrLength":' + _jsonNum(atrLen) + ',' +
+ '"volumeLength":' + _jsonNum(volLength) + ',' +
+ '"bbLength":' + _jsonNum(bbLength) + ',' +
+ '"bbMultiplier":' + _jsonNum(bbMult) + ',' +
+ '"emaFastLength":' + _jsonNum(emaFastLen) + ',' +
+ '"emaSlowLength":' + _jsonNum(emaSlowLen) + ',' +
+ '"breakoutLength":' + _jsonNum(breakoutLen) + ',' +
+ '"qualityFilterEnabled":' + (qualityEnabled ? 'true' : 'false') + ',' +
+ '"qualityEntryPassed":' + (qualityEntryPassed ? 'true' : 'false') + ',' +
+ '"qualityBaseRecent":' + (qualityBaseRecent ? 'true' : 'false') + ',' +
+ '"qualityBreakAge":' + _jsonNum(qualityBreakAge)
+
+// ═══════════════════════════════════════════════════════════════
+
+// LONG POZİSYON DURUMU
+
+// ═══════════════════════════════════════════════════════════════
+
+var float L_entry       = na
+
+var float L_stop        = na
+
+var float L_tp1         = na
+
+var float L_tp2         = na
+
+var float L_tp3         = na
+
+var float L_trail       = na
+
+var float L_atrVal      = na
+
+var float L_initialQty  = na
+
+var int   L_entryBar    = na
+
+var bool  L_inPos       = false
+
+var bool  L_tp1Taken    = false
+
+var bool  L_tp2Done     = false
+
+var bool  L_tp3Done     = false
+
+var bool  L_trailActive = false
+
+var label[] L_labels    = array.new<label>()
+
+var label L_infoLbl     = na
+
+
+
+// ─── LONG GİRİŞ
+
+if longEntryPulse and (not L_inPos or allowReEntry)
+
+    managedTradeActive := true
+
+    if array.size(L_labels) > 0
+
+        for i = 0 to array.size(L_labels) - 1
+
+            label.delete(array.get(L_labels, i))
+
+        array.clear(L_labels)
+
+    L_infoLbl := na
+
+
+
+    L_atrVal   := atr
+
+    L_entry    := close
+
+    L_entryBar := bar_index
+
+
+
+    if isPctMode
+
+        L_stop := L_entry * (1 - slPct / 100)
+
+        L_tp1  := L_entry * (1 + tp1Pct / 100)
+
+        L_tp2  := L_entry * (1 + tp2Pct / 100)
+
+        L_tp3  := L_entry * (1 + tp3Pct / 100)
+
+    else
+
+        L_stop := L_entry - L_atrVal * slAtrMult
+
+        L_tp1  := L_entry + L_atrVal * tp1AtrMult
+
+        L_tp2  := L_entry + L_atrVal * tp2AtrMult
+
+        L_tp3  := L_entry + L_atrVal * tp3AtrMult
+
+
+
+    riskAmt        = accountBalance * (riskPercent / 100.0)
+
+    initialPriceRsk = math.abs(L_entry - L_stop)
+
+    L_initialQty   := initialPriceRsk > 0 ? riskAmt / initialPriceRsk : 0.0
+
+
+
+    L_trail       := na
+
+    L_inPos       := true
+
+    L_tp1Taken    := false
+
+    L_tp2Done     := false
+
+    L_tp3Done     := false
+
+    L_trailActive := false
+
+
+
+    array.push(L_labels, label.new(bar_index, low, "LONG W" + str.tostring(waveCount) + "\nScore: " + str.tostring(pumpScore) + "/11\nSL: " + str.tostring(L_stop, "#.####") + "\nTP1: " + str.tostring(L_tp1, "#.####"), style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small))
+
+
+
+    alert(message='{' + _base("buy") +
+
+      ',"action":"buy","side":"BUY"' +
+
+      ',"entryPrice":' + _jsonNum(L_entry) +
+
+      ',"riskReward":' + _jsonNum(L_entry > L_stop ? (L_tp1 - L_entry) / (L_entry - L_stop) : na) +
+
+      ',"stop":' + str.tostring(L_stop, format.mintick) +
+
+      ',"sl":"' + str.tostring(L_stop, format.mintick) + '"' +
+
+      ',"tp1":' + str.tostring(L_tp1, format.mintick) +
+
+      ',"tp2":' + str.tostring(L_tp2, format.mintick) +
+
+      ',"tp3":' + str.tostring(L_tp3, format.mintick) +
+
+      ',"atr":' + str.tostring(L_atrVal, "#.######") +
+
+      ',"mode":"' + slTpMode + '"' +
+
+      ',"suggestedQty":"' + str.tostring(L_initialQty, "#.######") + '"' +
+
+      '}', freq=alert.freq_once_per_bar_close)
+
+
+
+// Giriş mumunda TP/SL simülasyonu yapılmaz; OHLC sırası bilinmediği için bir sonraki bardan başlatılır.
+
+canManage = L_inPos and not na(L_entryBar) and bar_index > L_entryBar
+
+
+
+// ─── STOP / TRAIL ÖNCELİĞİ — v2.2 daha geniş Trend Hold seviyeleri
+
+// low kullanılır: fitille seviyeye temas gerçekçi şekilde hit sayılır.
+
+L_slHit    = canManage and close <= L_stop
+
+L_trailHit = canManage and L_trailActive and not na(L_trail) and close <= L_trail
+
+
+
+if L_slHit or L_trailHit
+
+    exitType  = L_slHit ? "STOP" : "TRAIL_EXIT"
+
+    exitLevel = L_slHit ? L_stop : L_trail
+
+    exitColor = L_slHit ? color.red : color.orange
+
+
+
+    array.push(L_labels, label.new(bar_index, high * 1.01, L_slHit ? "STOP" : "TRAIL", style=label.style_label_down, color=exitColor, textcolor=color.white))
+
+
+
+    alert(message='{' + _base("stop") +
+
+      ',"action":"stop","side":"STOP"' +
+
+      ',"exitType":"' + exitType + '"' +
+
+      ',"exitPrice":' + str.tostring(exitLevel, format.mintick) +
+
+      ',"entryPrice":"' + str.tostring(L_entry, format.mintick) + '"' +
+
+      '}', freq=alert.freq_once_per_bar_close)
+
+
+
+    L_inPos       := false
+    managedTradeActive := false
+    lastManagedExitBar := bar_index
+
+    L_entry       := na
+
+    L_stop        := na
+
+    L_tp1         := na
+
+    L_tp2         := na
+
+    L_tp3         := na
+
+    L_trail       := na
+
+    L_atrVal      := na
+
+    L_initialQty  := na
+
+    L_entryBar    := na
+
+    L_tp1Taken    := false
+
+    L_tp2Done     := false
+
+    L_tp3Done     := false
+
+    L_trailActive := false
+
+
+
+// ─── TP1
+
+if canManage and L_inPos and not L_tp1Taken and high >= L_tp1
+
+    L_tp1Taken := true
+
+    float beStop = isPctMode ? L_entry * (1 + beOffsetPct / 100) : L_entry + L_atrVal * beOffsetMult
+
+    L_stop := math.max(L_stop, beStop)
+
+
+
+    if trailAfterTP1
+
+        L_trailActive := true
+        trailAtrBase = useDynamicTrailAtr ? math.max(L_atrVal, math.min(atr, L_atrVal * trailAtrCap)) : L_atrVal
+        L_trail := isPctMode ? high * (1 - trailPct / 100) : high - trailAtrBase * trailAtrMult
+
+
+
+    array.push(L_labels, label.new(bar_index, L_tp1, "TP1", style=label.style_label_down, color=color.lime, textcolor=color.black))
+
+
+
+    alert(message='{' + _base("tp1") +
+
+      ',"action":"tp1","side":"STOP"' +
+
+      ',"new_stop":' + str.tostring(L_stop, format.mintick) +
+
+      ',"tp1":' + str.tostring(L_tp1, format.mintick) +
+
+      ',"entryPrice":"' + str.tostring(L_entry, format.mintick) + '"' +
+
+      '}', freq=alert.freq_once_per_bar)
+
+
+
+// ─── TP2
+
+if canManage and L_inPos and L_tp1Taken and not L_tp2Done and high >= L_tp2
+
+    L_tp2Done := true
+
+    float lockStop2 = isPctMode ? L_entry * (1 + beOffsetPct2 / 100) : L_entry + L_atrVal * beOffsetMult2
+
+    L_stop := math.max(L_stop, lockStop2)
+
+    L_trailActive := true
+    trailAtrBase2 = useDynamicTrailAtr ? math.max(L_atrVal, math.min(atr, L_atrVal * trailAtrCap)) : L_atrVal
+    L_trail := isPctMode ? high * (1 - trailPctTP2 / 100) : high - trailAtrBase2 * trailAtrMultTP2
+
+
+
+    array.push(L_labels, label.new(bar_index, L_tp2, "TP2", style=label.style_label_down, color=color.aqua, textcolor=color.black))
+
+
+
+    alert(message='{' + _base("tp2") +
+
+      ',"action":"tp2","side":"TP2"' +
+
+      ',"new_stop":' + str.tostring(math.max(L_stop, L_trail), format.mintick) +
+
+      ',"tp2":' + str.tostring(L_tp2, format.mintick) +
+
+      ',"entryPrice":"' + str.tostring(L_entry, format.mintick) + '"' +
+
+      '}', freq=alert.freq_once_per_bar)
+
+
+
+// ─── TP3
+
+if canManage and L_inPos and L_tp2Done and not L_tp3Done and high >= L_tp3
+
+    L_tp3Done := true
+
+    L_trailActive := true
+    trailAtrBase3 = useDynamicTrailAtr ? math.max(L_atrVal, math.min(atr, L_atrVal * trailAtrCap)) : L_atrVal
+    L_trail := isPctMode ? high * (1 - trailPctTP3 / 100) : high - trailAtrBase3 * trailAtrMultTP3
+
+
+
+    array.push(L_labels, label.new(bar_index, L_tp3, "TP3", style=label.style_label_down, color=color.rgb(0, 200, 255), textcolor=color.white))
+
+
+
+    alert(message='{' + _base("tp3") +
+
+      ',"action":"tp3","side":"TP3"' +
+
+      ',"new_stop":' + str.tostring(math.max(L_stop, L_trail), format.mintick) +
+
+      ',"tp3":' + str.tostring(L_tp3, format.mintick) +
+
+      ',"entryPrice":"' + str.tostring(L_entry, format.mintick) + '"' +
+
+      '}', freq=alert.freq_once_per_bar)
+
+
+
+// ─── TRAILING — volatilite büyüdükçe ATR genişliği adapte olur; trail hiçbir zaman aşağı indirilmez.
+
+if canManage and L_inPos and L_trailActive
+
+    curTrailAtrMult = L_tp3Done ? trailAtrMultTP3 : L_tp2Done ? trailAtrMultTP2 : trailAtrMult
+
+    curTrailPct     = L_tp3Done ? trailPctTP3 : L_tp2Done ? trailPctTP2 : trailPct
+
+    trailAtrNow = useDynamicTrailAtr ? math.max(L_atrVal, math.min(atr, L_atrVal * trailAtrCap)) : L_atrVal
+    newT = isPctMode ? high * (1 - curTrailPct / 100) : high - trailAtrNow * curTrailAtrMult
+
+    if na(L_trail) or newT > L_trail
+
+        L_trail := newT
+
+
+
+// ═══════════════════════════════════════════════════════════════
+
+// GRAFİK
+
+// ═══════════════════════════════════════════════════════════════
+
+plot(L_inPos ? L_stop : na, "L-Stop", color=color.red, linewidth=2, style=plot.style_linebr)
+
+plot(L_inPos ? L_tp1 : na, "L-TP1", color=color.green, linewidth=1, style=plot.style_linebr)
+
+plot(L_inPos ? L_tp2 : na, "L-TP2", color=color.green, linewidth=2, style=plot.style_linebr)
+
+plot(L_inPos ? L_tp3 : na, "L-TP3", color=color.rgb(0, 200, 255), linewidth=2, style=plot.style_linebr)
+
+plot(L_trailActive ? L_trail : na, "L-Trail", color=color.orange, linewidth=2, style=plot.style_linebr)
+
+
+
+// Pozisyon bilgi etiketi — QTY giriş anında sabitlenmiştir.
+
+if L_inPos
+
+    float pct = (close - L_entry) / L_entry * 100
+
+    lc = pct >= 0 ? color.new(color.green, 60) : color.new(color.red, 60)
+
+    txt = "LONG: " + str.tostring(L_entry, "#.####") +
+
+      "\nSL: " + str.tostring(L_stop, "#.####") +
+
+      "\nTP1: " + str.tostring(L_tp1, "#.####") +
+
+      "\nTP2: " + str.tostring(L_tp2, "#.####") +
+
+      "\nTP3: " + str.tostring(L_tp3, "#.####") +
+
+      "\nMod: " + slTpMode +
+
+      "\nATR: " + str.tostring(L_atrVal, "#.####") +
+
+      "\nQTY: " + (na(L_initialQty) ? "—" : str.tostring(L_initialQty, "#.####")) +
+
+      "\nK/Z: " + (pct >= 0 ? "▲" : "▼") + str.tostring(math.abs(pct), "#.##") + "%" +
+
+      "\nTrail: " + (L_trailActive ? str.tostring(L_trail, "#.####") : "—")
+
+
+
+    if na(L_infoLbl)
+
+        L_infoLbl := label.new(bar_index + 20, L_stop, txt, style=label.style_label_left, color=lc, textcolor=color.white)
+
+        array.push(L_labels, L_infoLbl)
+
+    else
+
+        label.set_text(L_infoLbl, txt)
+
+        label.set_x(L_infoLbl, bar_index + 20)
+
+        label.set_y(L_infoLbl, L_stop)
+
+        label.set_color(L_infoLbl, lc)
+
+
+
+
+// Durum paneli — tablo
+var table infoTbl = table.new(position.top_right, 4, 16, border_width=1, frame_color=color.new(color.black, 0), border_color=color.new(color.black, 15), bgcolor=color.new(#04e2ff, 82))
+
+fPanelCell(_col, _row, _txt, _bg, _tc, _align, _size) =>
+    table.cell(infoTbl, _col, _row, _txt, text_color=_tc, bgcolor=_bg, text_halign=_align, text_size=_size)
+
+fStateBg(_ok) =>
+    _ok ? color.new(color.lime, 82) : color.new(color.red, 82)
+
+if barstate.islast
+    table.clear(infoTbl, 0, 0, 3, 15)
+
+    string stageName = stagedState == 1 ? "S1 SIKIŞMA" : stagedState == 2 ? "S2 UYANIŞ" : stagedState == 3 ? "S3 TEYİT" : "SCAN"
+    string stateText = longEntryPulse ? "LONG 🚀" : managedTradeActive ? "POZİSYON" : stagedMode ? stageName : longSignal and waveLocked ? "WAVE-LOCK" : prePumpRaw ? "PRE-PUMP ⚠" : "BEKLE"
+
+    color panelBg  = color.new(#04e2ff, 78)
+    color headerBg = color.new(#00c8ff, 38)
+    color labelBg  = color.new(#04e2ff, 68)
+    color txtColor = color.black
+
+    fPanelCell(0, 0, "PUMP EARLY", headerBg, txtColor, text.align_center, size.large)
+    fPanelCell(1, 0, "v2.3.4.4 SELECTIVE", headerBg, txtColor, text.align_center, size.large)
+    fPanelCell(2, 0, "15M PRESET", headerBg, txtColor, text.align_center, size.large)
+    fPanelCell(3, 0, "PRESERVE", headerBg, txtColor, text.align_center, size.large)
+
+    fPanelCell(0, 1, "Motor", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 1, entryEngineMode, panelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(2, 1, "Durum", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 1, stateText, panelBg, txtColor, text.align_left, size.normal)
+
+    fPanelCell(0, 2, "Skor", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 2, str.tostring(pumpScore) + "/11", panelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(2, 2, "Poz", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 2, managedTradeActive ? "AKTİF" : "FLAT", panelBg, txtColor, text.align_left, size.normal)
+
+    fPanelCell(0, 3, "S1 Setup", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 3, stageSeed ? "✅" : "❌", fStateBg(stageSeed), txtColor, text.align_center, size.normal)
+    fPanelCell(2, 3, "S2 Vol", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 3, stagedVolumeSeen ? "✅" : "❌", fStateBg(stagedVolumeSeen), txtColor, text.align_center, size.normal)
+
+    fPanelCell(0, 4, "Momentum", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 4, stagedMomentumSeen ? "✅" : "❌", fStateBg(stagedMomentumSeen), txtColor, text.align_center, size.normal)
+    fPanelCell(2, 4, "S3 Trend", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 4, trendOK ? "✅" : "❌", fStateBg(trendOK), txtColor, text.align_center, size.normal)
+
+    fPanelCell(0, 5, "RSI", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 5, str.tostring(rsi, "#.#") + " " + (rsiEarly ? "✅" : "❌"), panelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(2, 5, "MACD", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 5, macdAccel ? "✅" : "❌", fStateBg(macdAccel), txtColor, text.align_center, size.normal)
+
+    fPanelCell(0, 6, "Hacim", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 6, str.tostring(volumeRatio, "#.##") + "x " + (volumeExpansion ? "🚀" : ""), panelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(2, 6, "Fresh", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 6, stageFreshTriggerOK ? "✅" : "❌", fStateBg(stageFreshTriggerOK), txtColor, text.align_center, size.normal)
+
+    fPanelCell(0, 7, "Chase", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 7, stagedChaseOK ? "OK" : "UZAK", fStateBg(stagedChaseOK), txtColor, text.align_center, size.normal)
+    fPanelCell(2, 7, "RSIHeat", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 7, stagedHeatOK ? "OK" : "SICAK", fStateBg(stagedHeatOK), txtColor, text.align_center, size.normal)
+
+    fPanelCell(0, 8, "EMA21↑", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 8, stageSlowSlopeOK ? "✅" : "❌", fStateBg(stageSlowSlopeOK), txtColor, text.align_center, size.normal)
+    fPanelCell(2, 8, "CTX55", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 8, stageNormalContextOK ? "✅" : "❌", fStateBg(stageNormalContextOK), txtColor, text.align_center, size.normal)
+
+    fPanelCell(0, 9, "IGNITION", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 9, stageIgnition ? "🔥" : "❌", stageIgnition ? color.new(color.orange, 70) : color.new(color.red, 82), txtColor, text.align_center, size.normal)
+    fPanelCell(2, 9, "Breakout8", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 9, breakout ? "✅" : "❌", fStateBg(breakout), txtColor, text.align_center, size.normal)
+
+    fPanelCell(0, 10, "StructBO", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 10, stageIgnitionBreakout ? "✅" : "❌", fStateBg(stageIgnitionBreakout), txtColor, text.align_center, size.normal)
+    fPanelCell(2, 10, "Bear144", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 10, stageMacroBear ? "⚠" : "OK", stageMacroBear ? color.new(color.orange, 72) : color.new(color.lime, 82), txtColor, text.align_center, size.normal)
+
+    fPanelCell(0, 11, "Escape", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 11, stageBearEscapeOK ? "✅" : "❌", fStateBg(stageBearEscapeOK), txtColor, text.align_center, size.normal)
+    fPanelCell(2, 11, "NoiseGate", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 11, stageNoiseGateOK ? "✅" : "VETO", stageNoiseGateOK ? color.new(color.lime, 82) : color.new(color.red, 72), txtColor, text.align_center, size.normal)
+
+    fPanelCell(0, 12, "ScoreGate", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 12, stageScoreOK ? "✅" : "❌", fStateBg(stageScoreOK), txtColor, text.align_center, size.normal)
+    fPanelCell(2, 12, "Wave", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 12, "W" + str.tostring(waveCount) + " / " + str.tostring(waveResetScore) + "/4 " + (waveLocked ? "LOCK" : "READY"), panelBg, txtColor, text.align_left, size.normal)
+
+    fPanelCell(0, 13, "ExitCD", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 13, postExitReady ? "OK" : "BEKLE", postExitReady ? color.new(color.lime, 82) : color.new(color.orange, 75), txtColor, text.align_center, size.normal)
+    fPanelCell(2, 13, "TF / Aşama", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 13, timeframe.period + "m / " + (qualityEnabled ? "SEÇİCİ " : "") + (stagedMode ? stageName : "STRICT v2"), timeframe.period == "15" ? color.new(color.lime, 82) : color.new(color.orange, 72), txtColor, text.align_left, size.normal)
+
+    string qualityReason = not qualityEnabled ? "KAPALI" : qualityOnly15m and timeframe.period != "15" ? "15dk seç" : not qualityBaseRecent ? "Sakin bölge yok" : not qualityBreakFresh ? "Kırılım yok/geç" : not qualityTrendOK ? "Trend zayıf" : not qualityDataOK ? "Skor/hacim/RR" : not qualityMomentumOK ? "RSI/ADX/MACD" : not qualityCandleOK ? "Mum büyük/fitilli" : not qualityLocationOK ? "Fiyat uzak" : not qualityCooldownOK ? "Tekrar bekle" : "HAZIR"
+    fPanelCell(0, 14, "Seçici", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 14, qualityEntryPassed ? "✅" : "❌", fStateBg(qualityEntryPassed), txtColor, text.align_center, size.normal)
+    fPanelCell(2, 14, "Filtre", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 14, qualityReason, panelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(0, 15, "ADX", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(1, 15, str.tostring(observerAdx, "#.0"), fStateBg(observerAdx >= qualityAdxMin), txtColor, text.align_center, size.normal)
+    fPanelCell(2, 15, "Tekrar aralığı", labelBg, txtColor, text.align_left, size.normal)
+    fPanelCell(3, 15, str.tostring(qualityCooldownBars) + " bar", panelBg, txtColor, text.align_left, size.normal)
