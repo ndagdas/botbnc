@@ -5,6 +5,8 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 
 class Store:
@@ -23,6 +25,10 @@ class Store:
             self.execute(conn, 'CREATE INDEX IF NOT EXISTS observer_jobs_due ON observer_jobs(state,due)')
             self.execute(conn, '''CREATE TABLE IF NOT EXISTS observer_budgets (
                 name TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0)''')
+            self.execute(conn, '''CREATE TABLE IF NOT EXISTS observer_candidates (
+                id TEXT PRIMARY KEY, symbol TEXT NOT NULL, day TEXT NOT NULL,
+                accepted DOUBLE PRECISION NOT NULL)''')
+            self.execute(conn, 'CREATE INDEX IF NOT EXISTS observer_candidates_day ON observer_candidates(day)')
 
     @contextmanager
     def connection(self):
@@ -100,6 +106,32 @@ class Store:
             self.execute(conn, 'INSERT INTO observer_budgets(name,used) VALUES (?,0) ON CONFLICT(name) DO NOTHING', (key,))
             return self.execute(conn, 'UPDATE observer_budgets SET used=used+1 WHERE name=? AND used<?', (key, limit)).rowcount == 1
 
+    def candidate_day(self, now=None):
+        return datetime.fromtimestamp(time.time() if now is None else now,
+            ZoneInfo(os.getenv('CANDIDATE_TIMEZONE', 'Europe/Istanbul'))).strftime('%Y-%m-%d')
+
+    def reserve_candidate(self, conn, key, symbol, now=None):
+        """Atomic global Telegram AL-candidate cap; never counts exchange trades."""
+        now = time.time() if now is None else now
+        # A write before reads serializes candidate decisions in both backends.
+        self.execute(conn, "INSERT INTO observer_budgets(name,used) VALUES ('candidate_mutex',0) ON CONFLICT(name) DO NOTHING")
+        self.execute(conn, "UPDATE observer_budgets SET used=used WHERE name='candidate_mutex'")
+        if self.execute(conn, 'SELECT id FROM observer_candidates WHERE id=?', (key,)).fetchone():
+            return 'duplicate'
+        day = self.candidate_day(now)
+        count = self.execute(conn, 'SELECT COUNT(*) AS n FROM observer_candidates WHERE day=?', (day,)).fetchone()['n']
+        if count >= max(0, int(os.getenv('MAX_AL_CANDIDATES_PER_DAY', '6'))):
+            return 'day_limit'
+        cooldown = max(0, int(os.getenv('AL_SYMBOL_COOLDOWN_MINUTES', '480'))) * 60
+        if self.execute(conn, 'SELECT id FROM observer_candidates WHERE symbol=? AND accepted>? LIMIT 1', (symbol, now-cooldown)).fetchone():
+            return 'symbol_cooldown'
+        self.execute(conn, 'INSERT INTO observer_candidates(id,symbol,day,accepted) VALUES (?,?,?,?)', (key,symbol,day,now))
+        return 'accepted'
+
+    def candidates_today(self):
+        with self.connection() as conn:
+            return self.execute(conn, 'SELECT COUNT(*) AS n FROM observer_candidates WHERE day=?', (self.candidate_day(),)).fetchone()['n']
+
     def counts(self):
         with self.connection() as conn:
             return {r['kind'] + ':' + r['state']: r['n'] for r in self.execute(conn,
@@ -108,6 +140,7 @@ class Store:
     def cleanup(self):
         with self.connection() as conn:
             self.execute(conn, "DELETE FROM observer_jobs WHERE state<>'pending' AND updated<?", (time.time() - 7 * 86400,))
+            self.execute(conn, 'DELETE FROM observer_candidates WHERE accepted<?', (time.time() - 7 * 86400,))
 
 
 _store = None
