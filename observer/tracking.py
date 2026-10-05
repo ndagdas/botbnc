@@ -119,6 +119,11 @@ def process_job(store, job, reviewer, message_builder, telegram_sender):
         review = reviewer(payload)
         message = message_builder(payload, review)
         with store.connection() as conn:
+            if review['decision'] == 'AL':
+                candidate = store.reserve_candidate(conn, key, payload['symbol'])
+                if candidate not in {'accepted', 'duplicate'}:
+                    store.finish(conn, key, payload, result={**review, 'delivery': 'suppressed', 'limit_reason': candidate})
+                    return
             if review['decision'] == 'İZLE':
                 message += '\n' + start_watch(store, conn, key, payload, review)
             notify(store, conn, key, message)
@@ -136,6 +141,12 @@ def process_job(store, job, reviewer, message_builder, telegram_sender):
             snapshot = fetch_snapshot(payload['signal'])
             updated, terminal, message = watch_step(payload, snapshot, reviewer, now)
         with store.connection() as conn:
+            if terminal and updated.get('outcome') == 'AL ADAYI':
+                candidate = store.reserve_candidate(conn, key, updated['signal']['symbol'])
+                if candidate not in {'accepted', 'duplicate'}:
+                    updated['outcome'] = 'ADAY SINIRI'
+                    updated['limitReason'] = candidate
+                    message = None
             if message:
                 tag = hashlib.sha256(message.encode()).hexdigest()[:16]
                 notify(store, conn, key + ':' + tag, message)
