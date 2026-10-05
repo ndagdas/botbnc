@@ -39,7 +39,8 @@ NUMBER_FIELDS = {
     "bbLength", "bbMultiplier", "emaFastLength", "emaSlowLength", "breakoutLength",
     "signalAgeMinutes", "followupMovePct",
 }
-BOOL_FIELDS = {"breakoutConfirmed", "volumeConfirmed", "barConfirmed", "confirmed", "setupRecent"}
+BOOL_FIELDS = {"breakoutConfirmed", "volumeConfirmed", "barConfirmed", "confirmed", "setupRecent",
+               "qualityFilterEnabled", "qualityEntryPassed", "qualityBaseRecent"}
 SYMBOL_RE = re.compile(r"^[A-Z0-9_]{2,40}$")
 _worker_started = False
 _worker_lock = threading.Lock()
@@ -258,6 +259,12 @@ def deterministic_review(data):
         decision = "İZLE"
     if decision == "İZLE":
         score = min(69, score)
+    if decision == "AL" and score < int(os.getenv("CANDIDATE_MIN_SCORE", "85")):
+        decision, score = "İZLE", min(69, score)
+        reasons.append("seçici aday puanı eşiği sağlanmadı")
+    if data.get('qualityFilterEnabled') is True and data.get('qualityEntryPassed') is not True:
+        decision, score = "RED", min(44, score)
+        hard_reject.append("Pine seçici giriş filtresi sağlanmadı")
     return {"decision": decision, "score": score, "reasons": reasons,
             "hard_reject": hard_reject, "reviewer": "rules", "missing_fields": missing}
 
@@ -421,6 +428,7 @@ def health():
         store = get_store()
         counts = store.counts()
         details = {"storage_backend": store.backend, "restart_safe": store.restart_safe,
+                   "al_candidates_today": store.candidates_today(),
                    "active_watches": counts.get("watch:pending", 0),
                    "pending_reviews": counts.get("review:pending", 0),
                    "pending_notifications": counts.get("notify:pending", 0),
@@ -428,7 +436,11 @@ def health():
     except Exception as exc:
         details = {"storage_error": type(exc).__name__}
     return jsonify(status="degraded" if "storage_error" in details else "running",
-        version="observer-v2", mode="telegram_observation_only", binance_orders_enabled=False,
+        version="observer-v3-selective", mode="telegram_observation_only", binance_orders_enabled=False,
+        candidate_min_score=int(os.getenv("CANDIDATE_MIN_SCORE", "85")),
+        max_al_candidates_per_day=int(os.getenv("MAX_AL_CANDIDATES_PER_DAY", "6")),
+        candidate_timezone=os.getenv("CANDIDATE_TIMEZONE", "Europe/Istanbul"),
+        al_symbol_cooldown_minutes=int(os.getenv("AL_SYMBOL_COOLDOWN_MINUTES", "480")),
         telegram_configured=bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),
         ai_review_enabled=os.getenv("AI_REVIEW_ENABLED", "false").lower() == "true",
         ai_configured=bool(os.getenv("OPENAI_API_KEY")), ai_state=AI_STATE,
