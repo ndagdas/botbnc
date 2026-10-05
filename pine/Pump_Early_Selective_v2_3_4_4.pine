@@ -581,17 +581,18 @@ qualityRsiMin = input.float(54, "Min. RSI", minval=0, maxval=100, group="🎯 SE
 qualityRsiMax = input.float(72, "Maks. RSI", minval=0, maxval=100, group="🎯 SEÇİCİ 15DK")
 qualityAdxMin = input.float(18, "Min. ADX", minval=0, maxval=100, group="🎯 SEÇİCİ 15DK")
 qualityBodyPctMax = input.float(3, "Maks. giriş mum gövdesi %", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
-qualityBodyAtrMax = input.float(1.8, "Maks. gövde / önceki ATR", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
-qualityChaseAtrMax = input.float(1.2, "Maks. EMA9 uzaklığı / önceki ATR", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
+qualityBodyAtrMax = input.float(3.0, "Maks. gövde / önceki ATR", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
+qualityChaseAtrMax = input.float(2.8, "Maks. EMA9 uzaklığı / önceki ATR", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
 qualityCloseMin = input.float(0.65, "Min. mum kapanış konumu (0–1)", minval=0.1, maxval=1, step=0.05, group="🎯 SEÇİCİ 15DK")
 qualityBaseBars = input.int(12, "Sakin bölge bakışı (bar)", minval=4, maxval=96, group="🎯 SEÇİCİ 15DK")
 qualityBaseAtrMax = input.float(6, "Sakin bölge genişliği / önceki ATR", minval=1, step=0.5, group="🎯 SEÇİCİ 15DK")
 qualityBaseTTL = input.int(4, "Sakin bölge hafızası (bar)", minval=0, maxval=12, group="🎯 SEÇİCİ 15DK")
 qualityBreakBars = input.int(8, "Taze kırılım bakışı (bar)", minval=3, maxval=40, group="🎯 SEÇİCİ 15DK")
 qualityBreakTTL = input.int(2, "Kırılımdan sonra en çok bar", minval=0, maxval=5, group="🎯 SEÇİCİ 15DK")
-qualityBreakAtrMax = input.float(1.2, "Kırılım üstünde maks. uzaklık / önceki ATR", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
+qualityBreakAtrMax = input.float(2.5, "Kırılım üstünde maks. uzaklık / önceki ATR", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
 qualityCooldownBars = input.int(32, "Aynı paritede giriş aralığı (bar)", minval=1, maxval=400, group="🎯 SEÇİCİ 15DK")
 qualityRRMin = input.float(1.5, "Min. TP1 risk/getiri", minval=0.1, step=0.1, group="🎯 SEÇİCİ 15DK")
+qualityEarlyVolMin = input.float(3.0, "Erken kırılım için min. hacim x", minval=1.8, step=0.1, group="🎯 SEÇİCİ 15DK")
 
 qualityAtrRef = atr[1]
 qualityRangeWidth = ta.highest(high[1], qualityBaseBars) - ta.lowest(low[1], qualityBaseBars)
@@ -608,7 +609,8 @@ qualityChaseAtr = qualityAtrRef > 0 ? math.max(0, close - emaFast) / qualityAtrR
 qualityBreakAtr = qualityAtrRef > 0 ? math.max(0, close - qualityPriorHigh) / qualityAtrRef : na
 qualityClosePos = high > low ? (close - low) / (high - low) : 0.0
 qualityTrendOK = emaFast > emaSlow and close > emaFast and emaSlow > emaSlow[2] and close > emaContext and emaContext > emaContext[2]
-qualityMomentumOK = rsi >= qualityRsiMin and rsi <= qualityRsiMax and rsi > rsi[1] and observerAdx >= qualityAdxMin and observerPlusDI > observerMinusDI and macdHist > 0 and macdHist > macdHist[1]
+qualityAdxOK = observerAdx >= qualityAdxMin or (volumeRatio >= qualityEarlyVolMin and observerAdx > observerAdx[1] and qualityBreakFresh)
+qualityMomentumOK = rsi >= qualityRsiMin and rsi <= qualityRsiMax and rsi > rsi[1] and qualityAdxOK and observerPlusDI > observerMinusDI and macdHist > 0 and macdHist > macdHist[1]
 qualityCandleOK = close > open and bodyChangePct <= qualityBodyPctMax and qualityBodyAtr <= qualityBodyAtrMax and qualityClosePos >= qualityCloseMin
 qualityDataOK = pumpScore >= qualityScoreMin and volumeRatio >= qualityVolumeMin and qualityRR >= qualityRRMin
 qualityLocationOK = qualityBaseRecent and qualityBreakFresh and qualityChaseAtr <= qualityChaseAtrMax and qualityBreakAtr <= qualityBreakAtrMax
@@ -1231,3 +1233,23 @@ if barstate.islast
     fPanelCell(1, 15, str.tostring(observerAdx, "#.0"), fStateBg(observerAdx >= qualityAdxMin), txtColor, text.align_center, size.normal)
     fPanelCell(2, 15, "Tekrar aralığı", labelBg, txtColor, text.align_left, size.normal)
     fPanelCell(3, 15, str.tostring(qualityCooldownBars) + " bar", panelBg, txtColor, text.align_left, size.normal)
+
+// Veri penceresi / CSV incelemesi: fiyat grafiğine çizilmez.
+plot(rawWaveEntryPulse ? 1 : 0, "Q Raw", display=display.data_window)
+plot(qualityEntryPassed ? 1 : 0, "Q Pass", display=display.data_window)
+plot(pumpScore, "Q Score", display=display.data_window)
+plot(volumeRatio, "Q Volume", display=display.data_window)
+plot(rsi, "Q RSI", display=display.data_window)
+plot(observerAdx, "Q ADX", display=display.data_window)
+plot(qualityBodyAtr, "Q BodyATR", display=display.data_window)
+plot(bodyChangePct, "Q BodyPct", display=display.data_window)
+plot(qualityChaseAtr, "Q ChaseATR", display=display.data_window)
+plot(qualityBreakAtr, "Q BreakATR", display=display.data_window)
+plot(qualityBaseAge, "Q BaseAge", display=display.data_window)
+plot(qualityBreakAge, "Q BreakAge", display=display.data_window)
+plot(qualityClosePos, "Q ClosePos", display=display.data_window)
+plot(qualityTrendOK ? 1 : 0, "Q Trend", display=display.data_window)
+plot(qualityMomentumOK ? 1 : 0, "Q Momentum", display=display.data_window)
+plot(qualityCandleOK ? 1 : 0, "Q Candle", display=display.data_window)
+plot(qualityDataOK ? 1 : 0, "Q Data", display=display.data_window)
+plot(qualityLocationOK ? 1 : 0, "Q Location", display=display.data_window)
