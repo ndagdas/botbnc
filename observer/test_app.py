@@ -143,4 +143,50 @@ class ObserverTests(unittest.TestCase):
     def test_order_endpoint_blocked(self):
         with self.assertRaises(ValueError):public_get('/fapi/v1/order',{})
 
+    def test_global_six_candidate_limit_and_idempotency(self):
+        now=time.time()
+        with self.store.connection() as conn:
+            for i in range(6):
+                self.assertEqual(self.store.reserve_candidate(conn,str(i),f'COIN{i}USDT',now),'accepted')
+            self.assertEqual(self.store.reserve_candidate(conn,'six','OTHERUSDT',now),'day_limit')
+            self.assertEqual(self.store.reserve_candidate(conn,'0','COIN0USDT',now),'duplicate')
+        self.assertEqual(self.store.candidates_today(),6)
+
+    def test_symbol_cooldown_survives_day_boundary(self):
+        from datetime import datetime,timezone
+        before=datetime(2026,10,5,20,59,tzinfo=timezone.utc).timestamp()
+        after=before+120
+        self.assertEqual(self.store.candidate_day(before),'2026-10-05')
+        self.assertEqual(self.store.candidate_day(after),'2026-10-06')
+        with self.store.connection() as conn:
+            self.assertEqual(self.store.reserve_candidate(conn,'first','BTCUSDT',before),'accepted')
+            self.assertEqual(self.store.reserve_candidate(conn,'later','BTCUSDT',after),'symbol_cooldown')
+            self.assertEqual(self.store.reserve_candidate(conn,'next','ETHUSDT',after),'accepted')
+            self.assertEqual(self.store.reserve_candidate(conn,'late','BTCUSDT',after+9*3600),'accepted')
+
+    def test_concurrent_candidate_cap(self):
+        from concurrent.futures import ThreadPoolExecutor
+        def reserve(i):
+            with self.store.connection() as conn:
+                return self.store.reserve_candidate(conn,str(i),f'SYM{i}USDT')
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results=list(pool.map(reserve,range(8)))
+        self.assertEqual(results.count('accepted'),6)
+        self.assertEqual(results.count('day_limit'),2)
+
+    def test_quota_suppresses_extra_telegram_candidates(self):
+        with patch.dict(os.environ,MAX_AL_CANDIDATES_PER_DAY='1'):
+            for i,symbol in enumerate(['BTCUSDT','ETHUSDT']):
+                data=app_module.normalize_signal(signal(ticker=symbol,signalId=str(i)))
+                self.store.accept_review(f'review:{i}',data)
+                with self.store.connection() as conn:
+                    job=dict(self.store.execute(conn,'SELECT * FROM observer_jobs WHERE id=?',(f'review:{i}',)).fetchone())
+                    job['payload']=json.loads(job['payload'])
+                process_job(self.store,job,app_module.review_signal,app_module.telegram_message,lambda _:None)
+        self.assertEqual(self.store.counts()['notify:pending'],1)
+
+    def test_selective_filter_failure_cannot_be_al(self):
+        data=app_module.normalize_signal(signal(qualityFilterEnabled=True,qualityEntryPassed=False))
+        self.assertEqual(app_module.deterministic_review(data)['decision'],'RED')
+
 if __name__=='__main__':unittest.main()
