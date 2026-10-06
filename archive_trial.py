@@ -88,7 +88,7 @@ def main():
         except Exception as e:
             w.update(error=f'Takip arşivi eksik: {type(e).__name__}',tracking_status='VERİ EKSİK')
         return row,w,evidence
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=24) as pool:
         futures=[pool.submit(one,s) for s in symbols]
         for i,f in enumerate(as_completed(futures),1):
             row,w,e=f.result()
@@ -115,6 +115,20 @@ def main():
              'ambiguous':sum(w.get('first_event')=='SAME_BAR_UNCERTAIN' for w in complete),
              'stop_first':sum(w.get('first_event')=='STOP_FIRST' for w in complete)}
     (root/'ozet.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2))
+    watches={w['symbol']:w for w in snap['watches']}
+    groups=[]
+    for name in ('GÜÇLÜ TAKİP','TAKİP','ZAYIF','VERİ EKSİK'):
+        selected=[r for r in run['rows'] if r['classification']==name]
+        groups.append({'group':name,'count':len(selected),
+                       'pump':sum(watches.get(r['symbol'],{}).get('pump_hit',False) for r in selected),
+                       'pump_first':sum(watches.get(r['symbol'],{}).get('first_event')=='PUMP_FIRST' for r in selected)})
+    (root/'grup_sonuclari.json').write_text(json.dumps(groups,ensure_ascii=False,indent=2))
+    heading='<h2>1 Ekim 2026 arşiv denemesi</h2><p>Ölçüm: 30 Eylül ve 24–30 Eylül; takip: 1 Ekim 00:00–2 Ekim 00:00 UTC. Eski parite listesi kullanıldı; güncel evren doğrulanmadı.</p>'
+    table='<table><tr><th>Önceden belirlenen grup</th><th>Parite</th><th>%20 gördü</th><th>%3 düşüşten önce %20</th></tr>'
+    table+=''.join('<tr><td>'+g['group']+'</td><td>'+str(g['count'])+'</td><td>'+str(g['pump'])+'</td><td>'+str(g['pump_first'])+'</td></tr>' for g in groups)
+    table+='</table><p>Tek günlük araştırma denemesi; giriş kuralı doğrulanmadı. Arşiv denemesinde OI, funding, haber ve balina verisi yoktur. İlk olay, referans fiyata göre varsayımsal eşik sırasıdır.</p>'
+    report=root/'Takip_Ekrani.html'
+    report.write_text(report.read_text().replace('<input id="q"',heading+table+'<input id="q"'))
     print(json.dumps(summary,ensure_ascii=False),flush=True)
 
 

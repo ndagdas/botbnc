@@ -36,3 +36,11 @@ Ekran /, tüm tablo /api/snapshot, sağlık /health. Yalnız halka açık piyasa
 `python3 -m unittest -v test_flow_observer.py`
 
 Canlı tarama başlaması, geçmişte pump tahmini başarısının kanıtlandığı anlamına gelmez. İlk 24 saatlik cohort tamamlanmadan ileri sonuç raporu üretilmez.
+
+## İlk arşiv denemesi
+
+1 Ekim 2026 00:00 UTC itibarıyla Eylül ayının resmi Binance arşiviyle 527 parite ölçüldü; ertesi 24 saat 1 dakikalık mumlarla izlendi. 360 paritenin spot verisi de vardı. Bu eski evrenin üyeliği geriye dönük seçildiği için survivorship yanlılığı mümkündür. Güncel liste veya canlı tahmin değildir.
+
+16 parite %20 yükselişe ulaştı; 12'si önce referans fiyattan %3 düşmeden ulaştı. Yüksek puan grubunda 122 pariteden yalnızca biri %20 gördü ve o da önce %3 düştü. Dolayısıyla bu tek denemede yüksek puan seçimi fayda sağlamadı. Puan satın alma/işleme giriş kararı olarak kullanılmamalıdır. Tüm listeyi saklamak bu tür yanlış varsayımları görmemizi sağlar.
+
+Arşiv denemesinde OI, funding, haber, balina ve grup verileri yoktur. %3 araştırma eşiği gerçek stop emri veya kullanıcıya önerilen risk seviyesi değildir. Komisyon, fonlama ve gerçekleşebilir emir dolumu ölçülmediği için bu bir kârlılık backtesti değildir.

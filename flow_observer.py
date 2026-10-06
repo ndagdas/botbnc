@@ -458,16 +458,33 @@ def export(observer, directory):
     snap['static_export'] = True
     (root/'Takip_Ekrani.html').write_text(render_html(snap), encoding='utf-8')
     (root/'durum.json').write_text(json.dumps(snap, ensure_ascii=False, indent=2), encoding='utf-8')
-    columns = ['symbol','classification','score','score_source','status','spot_delta_24h_usdt',
-               'spot_delta_7d_usdt','futures_delta_24h_usdt','error']
+    columns = ['symbol','classification','score','score_source','status','asof_utc_ms',
+               'spot_delta_24h_usdt','spot_delta_7d_usdt','futures_delta_24h_usdt',
+               'futures_delta_7d_usdt','volume_ratio','futures_return_24h_pct',
+               'oi_change_24h_pct','funding_rate','tracking_reference','tracking_start_utc_ms',
+               'tracking_max_up_pct','tracking_max_down_pct','pump_hit','first_event',
+               'tracking_complete','reasons','error']
+    watches = {w['symbol']: w for w in snap['watches']
+               if w['run_id'] == (snap.get('run') or {}).get('id')}
     with (root/'Tum_Pariteler.csv').open('w', newline='', encoding='utf-8-sig') as f:
         writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
         for r in (snap.get('run') or {}).get('rows', []):
             out = {k: r.get(k) for k in columns}
+            source = r.get('spot') or r.get('futures') or {}
+            watch = watches.get(r['symbol'], {})
             out.update(spot_delta_24h_usdt=r.get('spot', {}).get('daily', {}).get('delta_usdt') if r.get('spot') else None,
                        spot_delta_7d_usdt=(r.get('spot', {}).get('weekly') or {}).get('delta_usdt') if r.get('spot') else None,
-                       futures_delta_24h_usdt=r.get('futures', {}).get('daily', {}).get('delta_usdt'))
+                       futures_delta_24h_usdt=r.get('futures', {}).get('daily', {}).get('delta_usdt'),
+                       futures_delta_7d_usdt=(r.get('futures', {}).get('weekly') or {}).get('delta_usdt'),
+                       asof_utc_ms=(snap.get('run') or {}).get('asof'),
+                       volume_ratio=source.get('daily', {}).get('volume_ratio'),
+                       futures_return_24h_pct=r.get('futures', {}).get('daily', {}).get('return_pct'),
+                       oi_change_24h_pct=r.get('open_interest', {}).get('change_24h_pct'),
+                       tracking_reference=watch.get('reference'), tracking_start_utc_ms=watch.get('start'),
+                       tracking_max_up_pct=watch.get('max_up_pct'), tracking_max_down_pct=watch.get('max_down_pct'),
+                       pump_hit=watch.get('pump_hit'), first_event=watch.get('first_event'),
+                       tracking_complete=watch.get('complete'), reasons=' | '.join(r.get('reasons', [])))
             writer.writerow(out)
     return snap
 
