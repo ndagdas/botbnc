@@ -79,7 +79,7 @@ class PublicMarket:
 class Store:
     def __init__(self, path='flow.sqlite3', url=None):
         self.path = path
-        self.url = url or os.getenv('FLOW_DATABASE_URL')
+        self.url = url or os.getenv('FLOW_DATABASE_URL') or os.getenv('DATABASE_URL')
         if os.getenv('DYNO') and not self.url:
             raise RuntimeError('Heroku takibi için kalıcı FLOW_DATABASE_URL gerekli')
         if not self.url:
