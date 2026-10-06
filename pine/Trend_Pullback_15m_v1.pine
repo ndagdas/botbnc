@@ -1,0 +1,206 @@
+//@version=6
+strategy("Trend Pullback 15m v1 — LONG", overlay=true, pyramiding=0, initial_capital=1000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.05, slippage=2, process_orders_on_close=false, calc_on_every_tick=false, calc_on_order_fills=false, margin_long=100)
+
+// Yeni motor: TREND → GERİ ÇEKİLME → YENİDEN YÜKSELİŞ.
+// Uzun yön; pozisyona ekleme yok. Bot/emir bağlantısı kurmaz.
+// Market emirleri varsayılan olarak sonraki mum açılışında simüle edilir.
+// SL ve TP sinyal kapanışına göre sabitlenir; açılış farkı gerçek R'yi değiştirir.
+
+only15m = input.bool(true, "Yalnız 15 dakika giriş", group="1 · Trend")
+fastLen = input.int(21, "Geri çekilme EMA", minval=2, group="1 · Trend")
+slowLen = input.int(55, "Trend EMA", minval=3, group="1 · Trend")
+slopeBars = input.int(5, "Trend eğimi bakış barı", minval=1, group="1 · Trend")
+minSlopeAtr = input.float(0.20, "Min. EMA55 ilerlemesi / ATR", minval=0, step=0.05, group="1 · Trend")
+diLen = input.int(14, "DMI uzunluğu", minval=2, group="1 · Trend")
+adxSmooth = input.int(14, "ADX yumuşatma", minval=2, group="1 · Trend")
+minAdx = input.float(23, "Min. ADX", minval=0, maxval=100, step=1, group="1 · Trend")
+holdAdx = input.float(20, "Geri çekilmede min. ADX", minval=0, maxval=100, step=1, group="1 · Trend")
+diRatioMin = input.float(1.15, "Min. +DI / -DI", minval=1, step=0.05, group="1 · Trend")
+effLen = input.int(14, "Fiyat verimliliği bakışı", minval=2, group="1 · Trend")
+effMin = input.float(0.35, "Min. yönlü fiyat verimliliği (0–1)", minval=0, maxval=1, step=0.05, group="1 · Trend")
+confirmBars = input.int(3, "Trend onayı ardışık mum", minval=1, maxval=10, group="1 · Trend")
+resetBars = input.int(3, "Yeni trend için bozulma mum sayısı", minval=1, maxval=20, group="1 · Trend")
+useHtf = input.bool(true, "Kapanmış üst periyot trend onayı", group="2 · Üst periyot")
+htf = input.timeframe("60", "Üst periyot", group="2 · Üst periyot")
+
+atrLen = input.int(14, "ATR uzunluğu", minval=2, group="3 · Geri çekilme")
+touchAtr = input.float(0.25, "EMA21 temas toleransı / ATR", minval=0, step=0.05, group="3 · Geri çekilme")
+minPullAtr = input.float(0.60, "Zirveden min. geri çekilme / ATR", minval=0.1, step=0.1, group="3 · Geri çekilme")
+waitBars = input.int(20, "Trend onayından sonra temas süresi", minval=2, maxval=100, group="3 · Geri çekilme")
+pullBars = input.int(6, "Temastan sonra tetik bekleme süresi", minval=1, maxval=30, group="3 · Geri çekilme")
+volLen = input.int(20, "Hacim ortalaması (önceki mumlar)", minval=2, group="4 · Giriş")
+volMin = input.float(1.20, "Tetik hacmi min. x", minval=0.1, step=0.05, group="4 · Giriş")
+resumeEff = input.float(0.15, "Tetikte min. yönlü verimlilik", minval=0, maxval=1, step=0.05, group="4 · Giriş")
+bodyMaxPct = input.float(2.5, "Maks. tetik gövdesi %", minval=0.1, step=0.1, group="4 · Giriş")
+chaseAtr = input.float(1.5, "Maks. EMA21 uzaklığı / ATR", minval=0.1, step=0.1, group="4 · Giriş")
+entriesPerTrend = input.int(1, "Trend başına maks. giriş", minval=1, maxval=3, group="4 · Giriş")
+cooldownBars = input.int(16, "Çıkış sonrası bekleme barı", minval=0, maxval=200, group="4 · Giriş")
+stopBufferAtr = input.float(0.30, "Geri çekilme dibi altı SL payı / ATR", minval=0, step=0.05, group="5 · Çıkış")
+minRiskAtr = input.float(0.60, "Min. SL mesafesi / ATR", minval=0.1, step=0.1, group="5 · Çıkış")
+maxRiskAtr = input.float(3.0, "Maks. SL mesafesi / ATR", minval=0.2, step=0.1, group="5 · Çıkış")
+maxRiskPct = input.float(3.0, "Maks. SL mesafesi %", minval=0.1, step=0.1, group="5 · Çıkış")
+targetR = input.float(2.0, "TP / başlangıç riski (R)", minval=0.5, step=0.25, group="5 · Çıkış")
+exitLostTrend = input.bool(true, "EMA55 altında kalınca pozisyonu kapat", group="5 · Çıkış")
+exitConfirm = input.int(3, "Trend çıkışı ardışık mum", minval=1, maxval=10, group="5 · Çıkış")
+entryAlerts = input.bool(true, "Yalnız LONG giriş alarmı üret", group="6 · Görünüm / alarm")
+showStages = input.bool(true, "Trend ve geri çekilme işaretleri", group="6 · Görünüm / alarm")
+showBackground = input.bool(true, "Trend durumunu renklendir", group="6 · Görünüm / alarm")
+
+if useHtf and timeframe.in_seconds(htf) <= timeframe.in_seconds()
+    runtime.error("Üst periyot, grafik periyodundan büyük olmalı.")
+if fastLen >= slowLen or minRiskAtr > maxRiskAtr
+    runtime.error("EMA21 uzunluğu trend EMA'dan küçük; min. SL mesafesi maks. SL'den küçük/eşit olmalı.")
+
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+atr = ta.atr(atrLen)
+[diPlus, diMinus, adx] = ta.dmi(diLen, adxSmooth)
+travel = ta.sma(math.abs(ta.change(close)), effLen) * effLen
+netMove = close - close[effLen]
+efficiency = travel > 0 ? math.max(0, netMove / travel) : 0.0
+slope = atr > 0 ? (emaSlow - emaSlow[slopeBars]) / atr : 0.0
+// [1] offset + lookahead_on: yalnız son kapanmış üst periyot mumu.
+fHtf() =>
+    f = ta.ema(close, fastLen)
+    s = ta.ema(close, slowLen)
+    [close[1], f[1], s[1], s[slopeBars + 1]]
+[htfClose, htfFast, htfSlow, htfSlowPast] = request.security(syminfo.tickerid, htf, fHtf(), lookahead=barmerge.lookahead_on)
+htfOK = not useHtf or (htfClose > htfSlow and htfFast > htfSlow and htfSlow > htfSlowPast)
+directionOK = emaFast > emaSlow and close > emaSlow and slope >= minSlopeAtr
+strengthOK = adx >= minAdx and diPlus > diMinus * diRatioMin
+progressOK = efficiency >= effMin
+tfOK = not only15m or timeframe.period == "15"
+readyData = not na(atr) and not na(adx) and not na(emaSlow[slopeBars]) and not na(travel) and atr > 0
+trendNow = readyData and tfOK and directionOK and strengthOK and progressOK and htfOK
+// Onaydan sonra normal geri çekilmenin başlangıç momentumunu düşürmesine izin ver.
+// Trendin yönü, üst periyot ve taban ADX şartı korunur.
+trendHold = readyData and tfOK and htfOK and emaFast > emaSlow and close > emaSlow and slope > 0 and adx >= holdAdx and diPlus > diMinus
+volRef = ta.sma(volume[1], volLen)
+volRatio = volRef > 0 ? volume / volRef : 0.0
+bodyPct = open > 0 ? math.abs(close - open) / open * 100 : 999.0
+
+// 0: bekle, 1: trend/temas bekle, 2: geri çekilme/tetik bekle,
+// 3: market emri bekliyor, 4: pozisyon açık.
+var int stage = 0
+var int trendRun = 0
+var int offRun = 0
+var int usedEntries = 0
+var int armedBar = na
+var int touchBar = na
+var int lastExitBar = na
+var int closedSeen = 0
+var int belowSlowRun = 0
+var float peak = na
+var float pullLow = na
+var float pullTrigger = na
+var float liveStop = na
+var float liveTarget = na
+bool trendPulse = false
+bool pullPulse = false
+bool entryPulse = false
+
+if barstate.isconfirmed
+    trendRun := trendNow ? trendRun + 1 : 0
+    offRun := trendHold ? 0 : offRun + 1
+    if offRun >= resetBars
+        usedEntries := 0
+
+    if strategy.closedtrades > closedSeen
+        closedSeen := strategy.closedtrades
+        lastExitBar := bar_index
+        stage := 0
+        liveStop := na
+        liveTarget := na
+        belowSlowRun := 0
+    if strategy.position_size > 0
+        stage := 4
+
+    if stage == 4
+        belowSlowRun := close < emaSlow ? belowSlowRun + 1 : 0
+        if exitLostTrend and belowSlowRun >= exitConfirm
+            strategy.close("L", comment="TREND LOST", disable_alert=true)
+    else if stage != 3
+        cooldownOK = na(lastExitBar) or bar_index - lastExitBar >= cooldownBars
+        canBuild = (stage == 0 ? trendNow : trendHold) and usedEntries < entriesPerTrend and cooldownOK
+        if not canBuild
+            stage := 0
+            armedBar := na
+            touchBar := na
+            peak := na
+            pullLow := na
+            pullTrigger := na
+        else
+            if stage == 0 and trendRun >= confirmBars
+                stage := 1
+                armedBar := bar_index
+                peak := high
+                trendPulse := true
+            else if stage == 1
+                peak := math.max(peak, high)
+                touched = low <= emaFast + touchAtr * atr and close > emaSlow and peak - low >= minPullAtr * atr
+                if bar_index - armedBar > waitBars
+                    stage := 0
+                else if touched
+                    stage := 2
+                    touchBar := bar_index
+                    pullLow := low
+                    pullTrigger := high
+                    pullPulse := true
+            else if stage == 2
+                // Önceki geri çekilme mumunun yüksek seviyesini aşmadan giriş yok.
+                candidateLow = math.min(pullLow, low)
+                candidateStop = math.min(candidateLow - stopBufferAtr * atr, close - minRiskAtr * atr)
+                risk = close - candidateStop
+                riskOK = candidateStop > 0 and risk > 0 and risk <= maxRiskAtr * atr and risk / close * 100 <= maxRiskPct
+                resume = bar_index > touchBar and close > pullTrigger and close > emaFast and close > open
+                candleOK = bodyPct <= bodyMaxPct and close - emaFast <= chaseAtr * atr
+                if bar_index - touchBar > pullBars
+                    stage := 0
+                else if resume and adx >= minAdx and efficiency >= resumeEff and diPlus > diMinus * diRatioMin and candleOK and volRatio >= volMin and riskOK
+                    entryPulse := true
+                    liveStop := candidateStop
+                    liveTarget := close + risk * targetR
+                    usedEntries += 1
+                    stage := 3
+                    strategy.entry("L", strategy.long, comment="TREND PULLBACK", disable_alert=true)
+                    strategy.exit("SL/TP", "L", stop=liveStop, limit=liveTarget, disable_alert=true)
+                    if entryAlerts
+                        message = '{"event":"LONG","strategy":"TrendPullback15m-v1","ticker":"' + syminfo.ticker + '","interval":"' + timeframe.period + '","signalClose":' + str.tostring(close, format.mintick) + ',"stop":' + str.tostring(liveStop, format.mintick) + ',"target":' + str.tostring(liveTarget, format.mintick) + ',"adx":' + str.tostring(adx, "#.##") + ',"efficiency":' + str.tostring(efficiency, "#.###") + ',"volumeRatio":' + str.tostring(volRatio, "#.##") + ',"barCloseTime":' + str.tostring(time_close) + '}'
+                        alert(message, alert.freq_once_per_bar_close)
+                else
+                    pullLow := candidateLow
+                    pullTrigger := high
+
+plot(emaFast, "EMA pullback", color=color.teal, linewidth=2)
+plot(emaSlow, "EMA trend", color=color.orange, linewidth=2)
+plot(stage == 2 ? pullTrigger : na, "Resume level", color=color.blue, style=plot.style_linebr)
+plot(stage >= 3 ? liveStop : na, "SL", color=color.red, style=plot.style_linebr)
+plot(stage >= 3 ? liveTarget : na, "TP", color=color.lime, style=plot.style_linebr)
+bgcolor(showBackground ? (trendNow ? color.new(color.green, 92) : color.new(color.gray, 95)) : na)
+plotshape(showStages and trendPulse, title="Trend ready", text="TREND", style=shape.circle, location=location.belowbar, color=color.blue, textcolor=color.blue, size=size.tiny)
+plotshape(showStages and pullPulse, title="Pullback ready", text="PB", style=shape.circle, location=location.belowbar, color=color.orange, textcolor=color.orange, size=size.tiny)
+plotshape(entryPulse, title="Confirmed LONG", text="LONG", style=shape.labelup, location=location.belowbar, color=color.green, textcolor=color.white, size=size.small)
+plot(adx, "ADX diagnostic", display=display.data_window)
+plot(efficiency, "Efficiency diagnostic", display=display.data_window)
+plot(volRatio, "Volume ratio diagnostic", display=display.data_window)
+
+var table panel = table.new(position.bottom_left, 2, 8, border_width=1)
+if barstate.islast or barstate.islastconfirmedhistory
+    reason = not tfOK ? "15dk seç" : not readyData ? "Veri bekle" : not directionOK ? "Yön/eğim yok" : not strengthOK ? "ADX/DMI zayıf" : not progressOK ? "Yatay/zikzak" : not htfOK ? "Üst periyot onaysız" : usedEntries >= entriesPerTrend ? "Trend kotası dolu" : not na(lastExitBar) and bar_index - lastExitBar < cooldownBars ? "Çıkış sonrası bekle" : "Trend uygun"
+    status = stage == 4 ? "POZİSYON" : stage == 3 ? "EMİR BEKLİYOR" : stage == 2 ? "YENİDEN YÜKSELİŞ BEKLE" : stage == 1 ? "GERİ ÇEKİLME BEKLE" : "BEKLE"
+    table.cell(panel, 0, 0, "TREND PULLBACK v1", bgcolor=color.navy, text_color=color.white)
+    table.cell(panel, 1, 0, "15m / LONG", bgcolor=color.navy, text_color=color.white)
+    table.cell(panel, 0, 1, "Durum", bgcolor=color.white)
+    table.cell(panel, 1, 1, status, bgcolor=color.white)
+    table.cell(panel, 0, 2, "Yeni giriş", bgcolor=color.white)
+    table.cell(panel, 1, 2, reason, bgcolor=trendNow ? color.new(color.lime, 70) : color.new(color.red, 75))
+    table.cell(panel, 0, 3, "ADX / min.", bgcolor=color.white)
+    table.cell(panel, 1, 3, str.tostring(adx, "#.0") + " / " + str.tostring(minAdx), bgcolor=color.white)
+    table.cell(panel, 0, 4, "Verimlilik / min.", bgcolor=color.white)
+    table.cell(panel, 1, 4, str.tostring(efficiency, "#.00") + " / " + str.tostring(effMin), bgcolor=color.white)
+    table.cell(panel, 0, 5, "Üst periyot", bgcolor=color.white)
+    table.cell(panel, 1, 5, not useHtf ? "KAPALI" : htfOK ? "ONAYLI" : "BEKLE", bgcolor=color.white)
+    table.cell(panel, 0, 6, "Trend girişleri", bgcolor=color.white)
+    table.cell(panel, 1, 6, str.tostring(usedEntries) + " / " + str.tostring(entriesPerTrend), bgcolor=color.white)
+    table.cell(panel, 0, 7, "Giriş hacmi / min.", bgcolor=color.white)
+    table.cell(panel, 1, 7, str.tostring(volRatio, "#.00") + " / " + str.tostring(volMin), bgcolor=color.white)
