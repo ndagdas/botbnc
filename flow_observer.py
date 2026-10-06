@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 HOUR, MINUTE, DAY = 3600000, 60000, 86400000
-VERSION = 'flow-observer-1.0'
+VERSION = 'flow-observer-1.1'
 SCHEMA = '''CREATE TABLE IF NOT EXISTS flow_records (
  id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL,
  updated DOUBLE PRECISION NOT NULL)'''
@@ -68,7 +68,12 @@ class PublicMarket:
         req = urllib.request.Request(url, headers={'User-Agent': VERSION}, method='GET')
         try:
             with urllib.request.urlopen(req, timeout=12) as r:
-                return json.loads(r.read(8 * 1024 * 1024))
+                # Spot exchangeInfo now exceeds 8 MiB; never parse a truncated body.
+                limit = 32 * 1024 * 1024
+                payload = r.read(limit + 1)
+                if len(payload) > limit:
+                    raise RuntimeError(f'{market}: veri yanıtı boyut sınırını aştı')
+                return json.loads(payload)
         except urllib.error.HTTPError as e:
             if e.code in (403, 418, 429, 451):
                 self.blocked.add(market)
@@ -299,7 +304,7 @@ class Observer:
             self.health('BLOCKED' if isinstance(e, AccessBlocked) else 'ERROR', str(e))
             return None
         run_id = str(now_ms())
-        run = {'id': run_id, 'asof': asof, 'created': now_ms(), 'status': 'SCANNING',
+        run = {'id': run_id, 'version': VERSION, 'asof': asof, 'created': now_ms(), 'status': 'SCANNING',
                'universe_count': len(eligible), 'excluded': excluded, 'rows': [],
                'windows': 'Son kapalı saat itibarıyla 24 saat / 7 gün; takvim mumu değil',
                'score_is_probability': False}
@@ -384,8 +389,9 @@ class Observer:
                 'max_up_pct': 0, 'max_down_pct': 0, 'complete': False,
                 'tracking_status': 'BAŞLANGIÇ BEKLENİYOR'})
         ok = sum(r['status'] == 'OK' for r in run['rows'])
-        state = 'BLOCKED' if 'futures' in self.market.blocked else 'READY' if ok == len(run['rows']) else 'DEGRADED'
-        self.health(state, f'{len(run["rows"])} parite kaydedildi; {ok} veri hazır; liste sınırı yok')
+        state = 'BLOCKED' if 'futures' in self.market.blocked else 'READY' if ok == len(run['rows']) and not spot_error else 'DEGRADED'
+        spots = sum(bool(r.get('spot')) for r in run['rows'])
+        self.health(state, f'{len(run["rows"])} parite kaydedildi; {ok} futures veri hazır; {spots} spot eşleşmesi; liste sınırı yok')
         return run
 
     def follow(self):
@@ -424,7 +430,7 @@ class Observer:
         while True:
             try:
                 latest = self.store.get('latest')
-                if not latest or now_ms() - latest['finished'] >= scan_interval*1000:
+                if not latest or latest.get('version') != VERSION or now_ms() - latest['finished'] >= scan_interval*1000:
                     if self.scan() is None:
                         return  # Restricted access does not trigger repeated requests.
                 self.follow()

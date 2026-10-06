@@ -1,6 +1,8 @@
 import json
+import io
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from flow_observer import (DAY, HOUR, MINUTE, AccessBlocked, Observer, PublicMarket,
                            Store, evaluate_minutes, features, rank_rows, spot_match,
@@ -18,6 +20,16 @@ def watch():
 
 
 class FlowTests(unittest.TestCase):
+    def test_large_spot_metadata_response_is_not_truncated(self):
+        payload = b' ' * (9 * 1024 * 1024) + b'{"symbols":[]}'
+        with patch('urllib.request.urlopen', return_value=io.BytesIO(payload)):
+            self.assertEqual(PublicMarket().get('spot','/api/v3/exchangeInfo'), {'symbols':[]})
+
+    def test_oversized_response_fails_explicitly(self):
+        with patch('urllib.request.urlopen', return_value=io.BytesIO(b' ' * (32*1024*1024+1))):
+            with self.assertRaisesRegex(RuntimeError, 'boyut sınırını'):
+                PublicMarket().get('spot','/api/v3/exchangeInfo')
+
     def test_true_quote_flow_and_windows(self):
         f = features(bars(400), 400*HOUR)
         self.assertEqual(f['daily']['taker_buy_usdt'], 1680)
